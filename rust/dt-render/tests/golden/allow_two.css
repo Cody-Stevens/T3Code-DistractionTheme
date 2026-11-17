@@ -1,0 +1,1 @@
+img[src*="glowtube-clip-"]:not([src*="glowtube-clip-a-run-1.svg"]):not([src*="glowtube-clip-b-run-2.svg"]){visibility:hidden!important}

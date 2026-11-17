@@ -9,17 +9,30 @@ publish.workspace = true
 dt-core.workspace = true
 # Pure-Rust RGB resizing/filtering; disable native codecs and AVIF's still-only encoders.
 image = { version = "0.25", default-features = false }
-# Pure-Rust lossless WebP preserves RGB marker colors; palette reduction must preserve them too.
-image-webp = "0.2.4"
 # Rasterize installed Segoe UI TTFs without shipping font files or adding a native library.
 fontdue = "0.9"
 # Data URLs carry the encoded bytes inside the CSS/SVG budgets.
 base64 = "0.22"
-# AVIF backend: external ffmpeg (libaom-av1 + avif muxer), via std::process.
-# libavif-sys 0.18 + codec-aom pulls libaom-sys 0.18's x86 CMake build, which requires
-# NASM/YASM unless assembly is disabled. Its build.rs exposes no assembly-disable switch.
-# This machine has MSVC/CMake but no NASM/clang. See ../README.md for evidence and the
-# ffmpeg alternative; do not substitute a still-only AVIF encoder such as ravif.
+# AVIF is linked from native/ via build.rs: libavif + generic libaom, no NASM or runtime process.
 
 [lints]
 workspace = true
+
+# Public-domain bitmap glyphs keep the missing-system-font fallback deterministic.
+[dependencies.font8x8]
+version = '0.3.1'
+# libwebp's optimizing lossless encoder meets the card budget; its C sources build with MSVC.
+[dependencies.webp]
+version = "0.3.1"
+
+[build-dependencies]
+# Build the vendored libaom/libavif C sources with MSVC/CMake and assembly disabled.
+cmake = "0.1.58"
+# Compressed, reviewable upstream source archives avoid thousands of vendored files.
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+# Extract the committed source archives into Cargo's private build directory.
+tar = "0.4"
+
+[dev-dependencies]
+# Independent pure-Rust WebP decoder verifies exact marker pixels after native lossless encoding.
+image-webp = "0.2.4"
