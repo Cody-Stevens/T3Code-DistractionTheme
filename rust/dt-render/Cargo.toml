@@ -1,0 +1,25 @@
+[package]
+name = "dt-render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+dt-core.workspace = true
+# Pure-Rust RGB resizing/filtering; disable native codecs and AVIF's still-only encoders.
+image = { version = "0.25", default-features = false }
+# Pure-Rust lossless WebP preserves RGB marker colors; palette reduction must preserve them too.
+image-webp = "0.2.4"
+# Rasterize installed Segoe UI TTFs without shipping font files or adding a native library.
+fontdue = "0.9"
+# Data URLs carry the encoded bytes inside the CSS/SVG budgets.
+base64 = "0.22"
+# AVIF backend: external ffmpeg (libaom-av1 + avif muxer), via std::process.
+# libavif-sys 0.18 + codec-aom pulls libaom-sys 0.18's x86 CMake build, which requires
+# NASM/YASM unless assembly is disabled. Its build.rs exposes no assembly-disable switch.
+# This machine has MSVC/CMake but no NASM/clang. See ../README.md for evidence and the
+# ffmpeg alternative; do not substitute a still-only AVIF encoder such as ravif.
+
+[lints]
+workspace = true

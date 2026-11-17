@@ -1,0 +1,39 @@
+name: Rust
+
+on:
+  push:
+    paths:
+      - 'rust/**'
+      - '.github/workflows/rust.yml'
+  pull_request:
+    paths:
+      - 'rust/**'
+      - '.github/workflows/rust.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      # actions/checkout v4; resolved with gh api, not a mutable tag at execution time.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      # dtolnay/rust-toolchain stable; resolved with gh api.
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Build locked workspace
+        run: cargo build --locked --workspace
+      - name: Clippy (including tests)
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Test locked workspace
+        run: cargo test --locked --workspace

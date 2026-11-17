@@ -1,0 +1,18 @@
+[package]
+name = "dt-media"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+dt-core.workspace = true
+# WASAPI on Windows, without a separate audio DLL. Keep device work inside this crate.
+cpal = { version = "0.16", default-features = false }
+# Pure-Rust FFT for the reference's 4096-sample Hann analysis windows.
+rustfft = "6.4"
+# Parse yt-dlp/ffprobe JSON; tools run through std::process without a shell.
+serde_json.workspace = true
+
+[lints]
+workspace = true

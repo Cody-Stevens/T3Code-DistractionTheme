@@ -1,0 +1,10 @@
+[package]
+name = "dt-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Shared contracts use only std: no codecs, device APIs, HTTP, or serialization dependencies.
+[lints]
+workspace = true
