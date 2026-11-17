@@ -7,7 +7,8 @@ Read [AGENTS.md](../AGENTS.md) first: it lists the T3 Code behaviours everything
 ## Goals
 
 - One binary, `distraction.exe`, with subcommands: `play [urls]`, `ctl <command> [arg]`,
-  `setup`, `service` (supervisor), `idle`.
+  `setup`, `service` (supervisor), `idle`, `install`, `uninstall`; plus the windowless
+  `distraction-service.exe` that `install` starts at sign-in.
 - Same behaviour and on-screen result as the Python helper, measured with the scripts in
   `python/tools/` (they work against any helper on port 47873).
 - Lower CPU and memory than Python, no Python runtime. External tools allowed at runtime:
