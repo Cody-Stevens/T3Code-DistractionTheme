@@ -1,0 +1,16 @@
+﻿[package]
+name = "rav1e-probe"
+version = "0.0.0"
+edition = "2024"
+[workspace]
+[dependencies]
+# Pure Rust, with every assembly/default feature disabled; only Rust thread-pool support is enabled.
+rav1e = { version = "=0.8.1", default-features = false, features = ["threading"] }
+# Share only the renderer's ordinary error type with its standalone muxer.
+dt-core = { path = "../../dt-core" }
+[[bin]]
+name = "rav1e-probe"
+path = "main.rs"
+[profile.release]
+codegen-units = 1
+lto = "thin"

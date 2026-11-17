@@ -1,0 +1,5 @@
+@keyframes gtjump{from{translate:0 0}to{translate:0 calc(var(--band)*-1)}}
+.messages-timeline-scroll [data-message-role="assistant"] .chat-markdown > :not(ul,ol),.messages-timeline-scroll [data-message-role="assistant"] .chat-markdown > :is(ul,ol) > li,.messages-timeline-scroll [data-user-message-bubble],.messages-timeline-scroll [data-timeline-row-kind]:not([data-timeline-row-kind="message"]){animation:gtjump linear both;
+animation-timeline:view(block 0px calc(100% - var(--by) - var(--band)/2));
+animation-range:entry-crossing 0% entry-crossing 100%}
+.messages-timeline-scroll{padding-top:var(--band)!important}
