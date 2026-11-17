@@ -66,6 +66,9 @@ pub struct FaviconConfig {
     pub run_id: String,
     /// API-to-first-frame latency, normally 500 ms.
     pub show_latency: Duration,
+    /// Optional first-clip gate latency for encoders whose short fast clips load sooner.
+    /// None uses show_latency, preserving Python's common latency for all clips.
+    pub first_show_latency: Option<Duration>,
     /// Equivalent to GLOWTUBE_FIRST_CLIP; normally 10 seconds, encoded fast.
     pub first_clip: Duration,
     /// Equivalent to GLOWTUBE_CLIP_SECONDS; normally 22 seconds, plus handover.
@@ -428,7 +431,8 @@ impl FaviconScheduler {
                             let at = (published_at
                                 + self
                                     .config
-                                    .show_latency
+                                    .first_show_latency
+                                    .unwrap_or(self.config.show_latency)
                                     .saturating_sub(input.output_latency))
                             .min(gate.deadline);
                             gate.release_at = Some(at);
