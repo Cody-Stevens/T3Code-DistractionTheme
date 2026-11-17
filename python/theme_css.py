@@ -42,6 +42,49 @@ def _properties() -> str:
     return "".join(out)
 
 
+def _text_flow(jumpers: str) -> str:
+    """Text blocks hop over the player instead of passing under it.
+
+    The band is the player plus a margin of --gm above and below. A block below the band stays put.
+    Once its top reaches the band's lower edge it is crossing, and when its bottom gets there it
+    moves up by the band's height, to just above the player. While it crosses, a clip hides the
+    band (nothing is drawn over the player) and a text-shadow copy of its text, one band higher,
+    shows the lines that have already crossed. Only text has a copy: images, icons and borders of
+    a crossing block stay hidden in the band until it has crossed.
+
+    The copy is on only while it cannot land on the block's own text: while the block's top is
+    still below the band's upper edge and its bottom is at most one band below the lower edge
+    (--gtb, from a second view timeline over that window). A block too tall for that (about two
+    bands) crosses without a copy: its upper part stays in place above the player until it hops.
+    """
+    up = "calc(var(--band)*-1)"
+    lo = "calc(100% - var(--by) - var(--band)/2)"          # band's lower edge, as an end inset
+    on = "calc(var(--gta)*var(--gtb))"
+    # Everything except the band, in the block's own coordinates: above the crossed share's copy
+    # and below the cut between crossed and uncrossed lines.
+    clip = ("polygon(-50% -999em,150% -999em,150% calc({c} - var(--band)),-50% calc({c} - var(--band)),"
+            "-50% {c},150% {c},150% 999em,-50% 999em)")
+    return (
+        "@property --gta{syntax:'<number>';inherits:false;initial-value:0}"
+        "@property --gtb{syntax:'<number>';inherits:false;initial-value:0}"
+        f"@keyframes gtjump{{from{{translate:0 0}}to{{translate:0 {up}}}}}"
+        f"@keyframes gtcut{{from{{--gta:1;clip-path:{clip.format(c='0%')}}}"
+        f"to{{--gta:1;clip-path:{clip.format(c='100%')}}}}}"
+        "@keyframes gtcopy{from,to{--gtb:1}}"
+        f"{jumpers}{{--gtts:0 0 3px #ffffffa0,0 {up} 0 rgb(255 255 255/{on}),0 {up} 3px rgb(255 255 255/calc({on}*.63));"
+        "animation:gtjump step-end both,gtcut linear none,gtcopy linear none;"
+        f"animation-timeline:view(block 0px {lo}),view(block 0px {lo}),"
+        "view(block calc(var(--by) - var(--band)/2) calc(100% - var(--by) - var(--band)*1.5));"
+        "animation-range:entry-crossing 0% entry-crossing 100%,entry-crossing 0% entry-crossing 100%,"
+        "entry-crossing 100% exit-crossing 0%}"
+        ".messages-timeline-scroll{padding-top:var(--band)!important}"
+        # The list gives each row container an inline `contain: paint layout style`. Paint
+        # containment clips a block that has hopped above its own row, so the text just above the
+        # player vanished whenever it belonged to an earlier row. Keep layout and style only.
+        '.messages-timeline-scroll [style*="contain"]{contain:layout style!important}'
+    )
+
+
 def static_css(video_w: int, video_h: int) -> str:
     # The card's live layer: 16 spectrum bars and the progress bar, drawn over the helper's card image
     # into the gaps it leaves (see card_image.py for the layout, in CSS pixels).
@@ -72,8 +115,9 @@ def static_css(video_w: int, video_h: int) -> str:
         ".messages-timeline-scroll [data-user-message-bubble],"
         '.messages-timeline-scroll [data-timeline-row-kind]:not([data-timeline-row-kind="message"])'
     )
+    text_flow = _text_flow(jumpers)
     css = f"""{_properties()}
-:root{{--g:1;--vw:{video_w}px;--vh:{video_h}px;--by:40%;--band:calc(var(--vh) + 56px)}}
+:root{{--g:1;--vw:{video_w}px;--vh:{video_h}px;--by:40%;--gm:8px;--band:calc(var(--vh) + var(--gm)*2)}}
 {CONV},{CONV}::before{{--glow:linear-gradient(#0000,#0000)}}
 {CARD}::before{{--cardimg:linear-gradient(#0000,#0000)}}
 {CONV}{{isolation:isolate;overflow:hidden;
@@ -96,13 +140,9 @@ box-shadow:0 0 0 1px #ffffff40,0 0 calc(18px + var(--bs)*70px*var(--g)) calc(var
 img[src*="glowtube-clip-"]{{position:fixed!important;position-anchor:--gtconv;left:anchor(50%,900px)!important;top:anchor(40%,400px)!important;
 translate:-50% -50%;width:var(--vw)!important;height:var(--vh)!important;max-width:none!important;max-height:none!important;
 z-index:2147483000;border-radius:12px;object-fit:cover;pointer-events:none}}
-@keyframes gtjump{{from{{translate:0 0}}to{{translate:0 calc(var(--band)*-1)}}}}
-{jumpers}{{animation:gtjump linear both;
-animation-timeline:view(block 0px calc(100% - var(--by) - var(--band)/2));
-animation-range:entry-crossing 0% entry-crossing 100%}}
-.messages-timeline-scroll{{padding-top:var(--band)!important}}
+{text_flow}
 {CONV} :is(.chat-markdown,[data-user-message-bubble],[data-timeline-row-kind]),{CONV} :is(.chat-markdown,[data-user-message-bubble],[data-timeline-row-kind]) *{{
-color:#fff!important;text-shadow:0 0 3px #ffffffa0}}
+color:#fff!important;text-shadow:var(--gtts,0 0 3px #ffffffa0)}}
 [data-slot="composer-host"]{{box-shadow:0 0 0 1px var(--c2),0 0 calc(12px + var(--bs)*60px*var(--g)) var(--c2),0 0 calc(var(--kk)*100px*var(--g)) var(--c2)!important}}
 [data-chat-header]{{box-shadow:0 1px calc(4px + var(--bs)*40px*var(--g)) var(--c0)}}
 [data-slot="sidebar-inner"]{{box-shadow:inset -1px 0 0 var(--c3),inset -14px 0 calc(var(--bs)*70px*var(--g)) -10px var(--c3)}}
@@ -123,8 +163,19 @@ background-position:{bar_pos},{ci.BAR_LEFT}px {bar_top}px}}
 
 
 def favicon_front_css(deck: str) -> str:
-    """With two favicon decks, the one showing the current clip is drawn on top."""
-    return f'img[src*="glowtube-clip-{deck}-"]{{z-index:2147483001!important}}'
+    """With two favicon decks, only the one showing the current clip is seen. z-index can't order
+    them (measured: the GlowTube row's image always paints over GlowTube B's, whatever their
+    z-index), so the back deck is made nearly transparent instead. It is still painted, so its clip
+    keeps playing in step until it is brought forward."""
+    return (f'img[src*="glowtube-clip-"]{{opacity:.01!important}}'
+            f'img[src*="glowtube-clip-{deck}-"]{{opacity:1!important;z-index:2147483001!important}}')
+
+
+def favicon_allow_css(files) -> str:
+    """Hide favicon clips other than the listed files: after a seek the old clips stay in place
+    (replacing them would collide with loading the new one) but must not show."""
+    keep = "".join(f':not([src*="{f}"])' for f in files)
+    return f'img[src*="glowtube-clip-"]{keep}{{visibility:hidden!important}}'
 
 
 def card_height_css(height: int) -> str:

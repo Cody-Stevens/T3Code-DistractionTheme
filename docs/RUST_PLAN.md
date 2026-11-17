@@ -36,8 +36,10 @@ Crates depend downward only: `distraction` -> {`dt-media`, `dt-render`, `dt-t3`,
 - AVIF: Chromium (Edge headless and T3's Electron) must **animate** it (some encoders' output only
   shows the still item; see AGENTS.md). Quality at equal size must be at least Pillow's libavif
   speed 10; speed-6-class quality for encode-ahead clips. Compare with `python/tools/encoder_match.py`.
-- Favicon overlay visible >= 96% of the time during playback (`python/tools/overlay_chart.py`),
-  audio/video offset within 0.2 s (`python/tools/sync_check.py`).
+- Favicon video covers the player 100% of the time music plays, across start, seeks, pause/resume
+  and track changes (`python/tools/overlay_chart.py` with `GLOWTUBE_MEASURE=1`); audio/video offset
+  within 0.25 s for >= 95% of samples (`python/tools/sync_full.py`); T3's own call latency under
+  0.3 s median while playing (`python/tools/t3_latency.py`). See AGENTS.md, "Favicon video".
 - Click detection: 28/28 targets at 100% and 150% scale, <= 1/400 false hits on video
   (`python/tools/click_test.py`).
 - Card image <= 9 KB base64; markers pixel-exact after encoding.

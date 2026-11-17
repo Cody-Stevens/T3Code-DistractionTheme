@@ -38,6 +38,17 @@ most of them are not documented by T3 Code.
 
 - **Write cadence.** 4 writes/s (250 ms), each with 8 frames (6 + 2 spare) at 24 fps. Writes are
   timed by the audio clock on a 6-frame grid so clips encoded ahead line up exactly.
+- **Every theme write restyles the whole page, and that is the main cost to T3.** In a long thread,
+  4 writes/s kept T3's renderer so busy that its own server calls waited ~2.2 s for a reply (median;
+  2 ms with the theme idle; `tools/t3_latency.py` reads this from T3's trace log). That delayed every
+  favicon load (below). So while a favicon clip covers the player (the theme's video is hidden),
+  a write carries 2 s of glow, values and card (`COVERED_STEP` = 48 frames, +12 spare) with a single
+  still video frame: one write per 2 s, ~0.14 s call latency. The text-flow rules are part of the
+  cost: the current ones (text-shadow copies, three timelines per block) cost ~4x the simpler ones
+  per write.
+- **Frame reader.** Keep decoded frames from 2 s before the *start* of the latest write. Trimming
+  from the last frame asked for discarded the next write's first frames, so every 2 s write restarted
+  the decoder and came back empty.
 - **Theme video.** Animated AVIF (libavif via Pillow) at up to 640x360. libavif speed 6 is ~2 dB
   better than speed 10 at equal size but takes 200-400 ms per clip, so six worker processes encode
   clips ~1.25 s ahead and each write takes the matching one, falling back to a speed-10 encode.
@@ -45,9 +56,13 @@ most of them are not documented by T3 Code.
 - **Glow.** Pre-rendered per frame by the helper (128x72, frame shrunk into the centre and blurred,
   widened by bass, kick shockwave ring), sent as an animated AVIF and stretched by CSS. Rendering
   the light in the helper is far cheaper than per-region color variables.
-- **Text and the player.** Text blocks use a scroll-driven `view()` timeline to slide across the
-  player band instead of sitting under it. Markdown blocks only in assistant rows; user bubbles move
-  as a whole (moving both double-shifts).
+- **Text and the player.** Text blocks use scroll-driven `view()` timelines to hop over the player
+  band instead of sitting under it, coming within 8 px of it (`--gm`). A crossing block stays put
+  under a clip-path while a text-shadow copy one band higher shows its lines that have crossed, then
+  it moves up by one band (`_text_flow` in `theme_css.py`). T3 sets an inline
+  `contain: paint layout style` on chat rows, which clipped hopped text; the theme drops the paint
+  part. Markdown blocks only in assistant rows; user bubbles move as a whole (moving both
+  double-shifts). Measure with `tools/gap_mock.py` / `gap_measure.py`.
 - **Card.** CSS cannot lay out multi-line text without backslashes, so the card is a lossless WebP
   (16-color palette at 2x, ~8 KB) drawn by the helper, with the live spectrum and progress bar as
   CSS layers on top. Its clickable areas use exact marker colors (`card_image.MARKS`); clicks are
@@ -70,23 +85,42 @@ most of them are not documented by T3 Code.
   the row's `content-visibility: auto` and the sidebar scroll viewport's **scroll-fade mask**. The
   theme lifts both (only while the clip is present) and anchors the image over the player with
   `anchor-name` / `position-anchor`.
-- **T3 abandons an in-flight favicon load when a theme update lands.** With 4 writes/s a favicon
-  swap took 6-11 s; with no writes it takes ~0.3 s. Before each swap the helper sends one long theme
+- **Favicon loads are slow while the theme is writing.** With 4 writes/s a favicon swap took 6-11 s;
+  with no writes it takes ~0.3 s. Before each swap the helper sends one long theme
   write (2.5 s of content) and holds writes for 2.2 s, publishing the clip 0.45 s into that window.
 - The server serves an external favicon only while the file exists. Clients may fetch late, so keep
   recent clips (30) and give every clip a unique name (run id + sequence).
-- **Swapping a favicon removes the old image while the new one loads (~0.3 s gap).** So there are two
-  projects ("decks"): "GlowTube" (a) and "GlowTube B" (b, rooted at `deck-b`). The next clip is
-  published to the back deck 3 s before the front clip ends; it starts playing underneath in step
-  with the audio, and 1.2 s later a theme write raises it (`favicon_front_css`: clip names carry the
-  deck letter, `glowtube-clip-<deck>-<run>-<seq>.svg`). Measured: 100% coverage in steady playback.
-- Clips are planned back to back from encode speed (speed 10 ~0.15 s and speed 8 ~0.22 s per second
-  of clip, +0.3 s start, 1.3x margin): each next clip is as long as the encoder can finish before it
-  is due, so after a start or seek they grow 6 s, ~13 s, ~33 s, 45 s. The first clip is a 6 s fast
-  encode 3 s ahead; until it shows, the theme's own video covers the player. The long quiet write
-  is built at the cheap level (~0.6 s); request it ~1.75 s before a clip starts. Frame durations
-  alternate 41/42 ms to average exactly 24 fps. While a favicon clip covers the player, the hidden
-  theme video is encoded cheaply.
+- **How T3 swaps a favicon** (`ProjectFavicon.tsx` in T3's source): the visible `<img>` keeps the old
+  file while a hidden `<img class="hidden">` loads the new URL; `onLoad` swaps them. A new URL means a
+  new image, so **its animation starts from frame 0 when it is shown**. Each URL carries a token the
+  client mints with `assets.createUrl`; when that call was slow (see the write cadence above), the
+  client swapped the same clip a second time 7-10 s after publishing, restarting it 10+ s behind the
+  audio. `tools/load_watch.py` (with `GLOWTUBE_SHOW_LOADING=1`) shows each deck's loader.
+- **Two decks.** Two projects, "GlowTube" (a) and "GlowTube B" (b, rooted at `deck-b`), so each clip
+  loads behind the one on screen. The next clip is published to the back deck 3 s before the front
+  clip ends; it starts playing underneath in step with the audio, and 1.2 s later it is brought
+  forward (`favicon_front_css`; clip names carry the deck letter,
+  `glowtube-clip-<deck>-<run>-<seq>.svg`). **z-index does not order the two images**: GlowTube's
+  row always painted over GlowTube B's whatever their z-index. So the back deck gets opacity 0.01
+  (still painted, so it keeps playing) and the front deck opacity 1.
+- **Stale clips are hidden by name, not replaced.** After a seek, publishing blank favicons to both
+  decks collided with loading the first new clip (it never showed). Instead the theme lists the
+  clip files allowed to show (each deck's current clip and the planned ones,
+  `favicon_allow_css`) and hides every other clip image. Blanks are published only when the favicon
+  video stops (pause, `favicon off`, quit).
+- **Clip plan.** Clips are planned back to back from encode speed (speed 10 ~0.15 s and speed 8
+  ~0.22 s per second of clip, +0.3 s start, 1.3x margin): each next clip is as long as the encoder
+  can finish before it is due, up to 22 s (+3 s handover). Longer clips (45 s) went out of sync in
+  the measurements. The first clip after a start, seek or resume is 10 s at the fast setting;
+  publishing the next one only ~4 s after a 6 s first clip made the first blink out.
+- **The music waits for the picture.** After a start, seek or resume the audio is held (silence, the
+  clock frozen) until the first clip is published, then released ~0.5 s later, when it shows; at
+  most 6 s (`GLOWTUBE_GATE=0` turns this off). A busy encoder (a 45 s clip takes ~10 s) is replaced
+  rather than waited for. Measured: 100% coverage while music plays across start, seeks,
+  pause/resume and the track looping; audio/video offset median 0.08 s, 95% within 0.25 s
+  (`tools/sync_full.py`, which matches the screen against the whole source video).
+- The long quiet write is built cheaply (a still video frame under a clip, ~0.25 s); request it
+  ~1.75 s before a clip starts. Frame durations alternate 41/42 ms to average exactly 24 fps.
 - Each favicon only renders inside a sidebar thread row, so each deck project needs one idle thread.
   Setup does not create these yet (`t3 thread start` always sends an agent message); creating an
   idle thread through the API is open work.
