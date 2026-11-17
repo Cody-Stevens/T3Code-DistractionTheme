@@ -138,6 +138,7 @@ fn every_write_carries_all_layers_and_refuses_overflow() {
     };
     let mut state = DynamicState::default();
     let input = || DynamicInput {
+        extra_css: "",
         frames: &frames,
         glows: &glows,
         values: &values,
@@ -225,6 +226,7 @@ fn covered_write_animates_values_and_glow_over_one_still() {
     };
     let mut state = DynamicState::default();
     let input = || DynamicInput {
+        extra_css: "",
         frames: &video[..1],
         glows: &glows,
         values: &values,
@@ -301,6 +303,7 @@ fn diagnostic_switches_reach_builder_and_budget() {
         &encoder,
         &mut DynamicState::default(),
         DynamicInput {
+            extra_css: "",
             frames: &video,
             glows: &[],
             values: &values,

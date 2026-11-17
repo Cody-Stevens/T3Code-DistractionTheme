@@ -34,6 +34,9 @@ pub struct DynamicInput<'a> {
     pub values: &'a [CssValues],
     /// Cached card (the CSS still carries it on every write).
     pub card: &'a Card,
+    /// Complete additional rules (e.g. the front-deck selector), included in the head BEFORE
+    /// calculating video room. Count these toward CSS_LIMIT on every write.
+    pub extra_css: &'a str,
     /// Whether animation advances instead of applying just the first frame's values.
     pub playing: bool,
     /// Intensity in 0..=11.
@@ -271,6 +274,7 @@ pub fn build_dynamic(
     let mut head = format!(":root{{--g:{:.2}}}{vars}", input.chaos / 11.0)
         + &card_height_css(input.card.height)
         + &card_image_css(input.card)
+        + input.extra_css
         + &diagnostic_css_from_env();
     if !input.glows.is_empty() {
         head.push_str(&glow_css(&avif(encoder, input.glows, 30)?));
