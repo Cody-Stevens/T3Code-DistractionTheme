@@ -1,11 +1,15 @@
-//! CLI and orchestration boundary. Only `ctl` is implemented in phase one.
-//! Other subcommands return a clear error before touching audio, files, T3 state or the helper.
+//! Queue, audio-grid rendering, loopback control and supervised native adapter ownership.
 
 pub mod ahead_pool;
 pub mod cli;
 pub mod control;
+pub mod favicon;
 pub mod player;
+pub mod runtime;
 pub mod supervisor;
+#[cfg(test)]
+mod tests;
+mod worker;
 pub mod write_loop;
 
 use dt_core::{Error, Result};
@@ -22,8 +26,8 @@ pub fn run(cli: cli::Cli) -> Result<()> {
             Ok(())
         }
         cli::Command::Play { urls } => player::play(urls),
-        cli::Command::Setup => Err(Error::NotImplemented("setup")),
+        cli::Command::Setup => runtime::setup_with_paths(dt_t3::T3Paths::discover()?),
         cli::Command::Service => supervisor::serve(),
-        cli::Command::Idle => Err(Error::NotImplemented("idle")),
+        cli::Command::Idle => runtime::idle(),
     }
 }
