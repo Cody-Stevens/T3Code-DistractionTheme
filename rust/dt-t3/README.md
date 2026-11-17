@@ -33,25 +33,46 @@ invalid settings are left intact. A missing settings file is initialized. Both t
 and writer enforce the 49,500 CSS budget and 48-character name limit, counted as UTF-16 units to
 match JavaScript. The binary still owns the 250 ms audio-grid cadence and quiet holds.
 
-Feed `FaviconScheduler::tick` loaded track metadata, audible media time, monotonic wall time,
-encode completions and the latest quiet-write grant. Execute returned actions in order:
+Feed `FaviconScheduler::tick` loaded track metadata, audible media time, the player's explicit
+`jumps` counter, monotonic wall time, output latency, worker/API completions and the latest quiet
+write grant. Increment `jumps` on every seek and track change, including looping the same track.
+Do not infer jumps from clip ranges. Execute actions in order:
 
-- Queue `ClipJob` on one dedicated serial encoder. The job carries deck, start, duration,
-  output, quality/speed intent and estimated completion time. Return its actual frame count.
+- `HoldAudio` silences the player and freezes its clock. Return `AudioHeld` with the request ID
+  and the exact frozen position; only then does the scheduler queue the first clip. Enforce the
+  supplied six-second deadline in the audio owner even if no more ticks arrive. `ReleaseAudio`
+  replaces that deadline with a successful publication's acknowledgment time plus
+  `max(0, show_latency - output_latency)`; `None` releases immediately. A new hold replaces any
+  earlier release timer. The scheduler also releases an unacknowledged hold at the deadline.
+- Queue `ClipJob` on one dedicated serial encoder. Report `EncodeStarted` when work starts,
+  then `Encoded` with actual frame count or `EncodeFailed`. Synchronize start notifications
+  with tick/cancellation so a running job cannot appear queued when it is dropped.
+- `CancelPending` cancels queued work. `ReplaceEncoder` follows when dropped work is already
+  running: terminate the old worker and its decoder, create and warm a replacement, then queue
+  subsequent `Encode` actions. Exact job matching rejects obsolete results.
 - For `RequestQuiet`, build 2.5 seconds of cheap theme content, land the write and hold further
   writes for 2.2 seconds. Pass the **time the write landed** in `quiet_granted_at`; this crate
-  adds the 450 ms settle. Python stores the already-settled time instead.
-- Publish the supplied path to the supplied project. Apply `SetFront` through the renderer's
-  `favicon_front_css(deck.name())` in each complete write. `SetLive` controls cheap hidden video.
-- Write `BLANK_SVG` to `clips_dir/glowtube-blank.svg` before executing `Blank`. Retain
-  the newest 30 owned `glowtube-clip-*.svg` files on `Cleanup`; do not remove current files early.
-- Cancel jobs on `CancelPending`; late completions are rejected by exact job identity. Cancellation
-  need not interrupt a running encoder. Call `stop` and execute its blanks before shutdown.
+  adds the 450 ms settle. Python stores the already-settled time instead. A request may precede
+  encode completion, but publication always requires a completed encode.
+- Publish the supplied path to the supplied project and always return `Published` or
+  `PublishFailed`. While awaiting acknowledgment, the scheduler retains the planned filename
+  and issues no further publication. Only success replaces the deck's clip/file or sets it live.
+  A failure retains the old deck and continues planning.
+- Apply `SetFront` through `favicon_front_css(deck.name())`, and `SetAllowedFiles` through
+  `favicon_allow_css` in every complete theme write. The latter contains filenames, not absolute
+  paths: each deck's current clip plus planned/publishing clips. An empty list hides stale images.
+  `SetLive` controls cheap hidden video. Seeks, track changes and expired clips restart through
+  these theme rules, without publishing blanks.
+- Write `BLANK_SVG` to `clips_dir/glowtube-blank.svg` before executing `Blank`. Blanks occur only
+  when the video stops (pause, disabled/unavailable playback, quit). Retain the newest 30 owned
+  `glowtube-clip-*.svg` files on `Cleanup`. Call `stop` and execute its effects before shutdown.
 
 Pass distinct project IDs, an absolute clip directory and a unique run ID (a UUID is suitable).
-Each filename includes deck, run and sequence. Deck B is optional for Python's single-deck
-fallback, which exposes theme video while swapping. The API changes are confined to dt-t3;
-no shared or sibling crate changed.
+Each filename includes deck, run and sequence. Set `first_clip` to 10 seconds, `clip_seconds` to
+22 seconds and `gate` to true for Python defaults. The binary can override these from
+`GLOWTUBE_FIRST_CLIP`, `GLOWTUBE_CLIP_SECONDS` and `GLOWTUBE_GATE`. The state machine reads no
+environment variables. Deck B remains optional for Python's single-deck fallback; coverage
+acceptance requires two decks and the gate enabled. No shared or sibling crate changed.
 
 ## Idle sidebar threads
 
@@ -81,23 +102,27 @@ subject, so `/mcp` rejects them even though the projects API works. Setup then r
 MCP endpoint. Each deck still needs an idle sidebar thread in that case; the binary should
 surface this result. Other failures are returned as errors rather than hidden.
 
-## Reference parity and retained flaws
+## Reference parity
 
-The current Python methods plan full durations 6.0, 12.167832, 31.006406 and 48.0 seconds for
-the default 500 ms show latency. The last is 45 seconds plus its 3-second handover. Starts are
-3.0, 6.6, 15.767832 and 43.774238 seconds. These are adaptive encode-budget results; the older
-8/24/45 ramp in the workspace README is obsolete.
+Current Python and Rust plan full durations of 10.0, 10.839161, 25.0 and 25.0 seconds with the
+default gate, 500 ms show latency and measured serial encode costs. The last two are 22 seconds
+plus three seconds of overlap. Starts are 0.0, 7.0, 14.839161 and 36.839161 seconds. At most two
+clips remain planned or publishing; each follows the newest planned/published clip. When the
+encoder is behind, the next start moves later rather than queuing an impossible deadline.
 
-Python marks a deck's clip live even if its favicon API request fails: `_publish` catches the
-error, then `_tick` assigns `deck.clip` unconditionally. Rust retains this optimistic state for
-`PublishFailed`, so successful simulation coverage does not cover API failures. Python also
-detects seeks by comparing media time with the front clip's range and pending deadline. A seek
-that stays within that range is not detected and can leave the SVG animation out of sync. The
-Rust simulation records that limitation rather than silently changing reference behavior.
+The former optimistic publish state and undetected in-range seek behavior are removed, matching
+Python #9. The first clip begins at the held media position, and music resumes when that image
+shows. Quiet windows are requested about 1.75 seconds before a clip starts, once its encode is
+complete or due within 0.5 seconds. A late encode drops the plan and replaces a running worker.
 
-The first publication also marks the deck live before the image loads. A cold long-write build
-of 1.6 seconds delays first publication to about 3.4 seconds; theme video covers the initial gap.
-Track changes and seeks outside the front range blank both decks and rebuild the short ramp.
+A six-second timeout intentionally lets music resume even if no picture arrived. Failures that
+outlast that limit, the disabled gate, and single-deck mode can expose theme video. Simulated
+100% favicon coverage applies to successful playback, including start, seeks, resume and track
+changes; it does not claim coverage during encoder/API outages. In particular, after a failed
+handover, Python waits until a poll
+observes the front clip has expired before restarting and holding audio. At the 100 ms polling
+cadence this leaves up to one tick uncovered (60.839161 ms in both replays). Rust preserves that
+transition; the failed-publish test measures the gap and then verifies held recovery.
 
 ## Validation
 
@@ -109,6 +134,7 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
 cargo test --locked -p dt-t3 -- --nocapture
 python dt-t3/tests/reference_replay.py
+python dt-t3/tests/reference_replay.py --failed-handover
 ```
 
 The optional Python replay extracts only constants and scheduler definitions from the reference
@@ -121,10 +147,11 @@ Measured on this Windows worktree with debug tests:
 | Applicable quality bar | Result and method |
 | --- | --- |
 | CSS <=49,500, name <=48 | Boundary tests accept the limit, reject one unit over it, and check astral Unicode as two UTF-16 units. |
-| Atomic theme writes | Concurrent reader sees complete JSON through 40 replacements; Windows locked-file test verifies failure reporting and temp cleanup. At 49,500 CSS units, median write overhead 14.41 ms, worst 35.84 ms across those 40 writes. This excludes rendering and is not the full build-time measurement. |
-| Favicon >=96% visible | Fake clock: 2,971/2,971 covered samples from 3.0 to 300.0 seconds, plus continuous front-interval coverage assertions between every flip. This is 100% modeled steady coverage; live overlay acceptance remains for integration. |
-| A/V offset <=0.2 s | Simulation asserts abs(publish media time + 0.5 s load delay - encoded start) <=0.2 s for every steady publication, and waits >=1.2 s to raise back decks. Live image/audio sync is unmeasured. |
-| Late/start/seek/end behavior | Cold and slow-cold starts, two seek directions, track change/end, late and failed encodes, stale completions, pause/disable/stop and missing quiet grants all use fake clocks without sleeps. |
+| Atomic theme writes | Concurrent reader sees complete JSON through 40 replacements; Windows locked-file test verifies failure reporting and temp cleanup. At 49,500 CSS units, median write overhead 8.93 ms, worst 25.54 ms across those 40 writes. This excludes rendering and is not the full build-time measurement. |
+| Favicon 100% while music plays | Fake clock: 3,001/3,001 audible samples through 300 s, plus every continuous advancing interval, including the first audible instant. The same interval checks cover an in-range seek, track change, same-track loop and pause/resume. Held silence is excluded. Live overlay acceptance remains for integration. |
+| A/V offset <=0.25 s for >=95% | Every steady publication satisfies abs(publish media time + 0.5 s load delay - encoded start) <=0.25 s. Gate tests verify release delay subtraction at 0, 0.1 and 0.8 s output latency; startup at the measured 0.1 s output latency aligns picture and music. Actual image/audio sync is unmeasured. |
+| T3 call latency median <0.3 s | Unmeasured live, as requested. API tests use mock servers; no simulation result establishes the live latency bar. |
+| Restart/failure/planning behavior | Sixteen fake-clock tests cover successful and failed publications, in-range seeks, track changes/loop/end, pause/resume/off/quit, busy-worker replacement, queued/finished cancellation, late and failed encodes, stale completions, missing grants/hold acknowledgments, six-second timeout, gate off, configurable lengths and delayed starts. |
 
 The complete 250 ms write loop, rendering time, actual Chromium visibility/sync, AVIF quality,
 click accuracy and card size belong to integration or other crates. No live measurement is
