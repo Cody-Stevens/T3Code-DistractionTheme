@@ -9,7 +9,7 @@ use dt_core::{CardTarget, Error, Result, constants::*};
 use dt_platform::input::{self, InputEvent};
 use dt_render::{
     card::{CardContent, CardRenderOptions},
-    encode::FfmpegAvifEncoder,
+    encode::NativeAvifEncoder,
 };
 use dt_t3::{
     T3Paths,
@@ -41,12 +41,9 @@ pub fn download_config() -> Result<dt_media::DownloadConfig> {
         cache_dir: state_dir()?.join("cache"),
     })
 }
-/// Separate seekable encode scratch directory inside local state.
-pub fn encoder() -> Result<FfmpegAvifEncoder> {
-    Ok(FfmpegAvifEncoder {
-        ffmpeg: "ffmpeg".into(),
-        work_dir: state_dir()?.join("encode"),
-    })
+/// Production in-process libavif backend; favicon work uses it in a separately owned child.
+pub fn encoder() -> Result<NativeAvifEncoder> {
+    Ok(NativeAvifEncoder)
 }
 /// System fonts are supplied by path rather than embedded.
 pub fn card_options() -> CardRenderOptions {
@@ -112,12 +109,9 @@ impl dt_t3::setup::TokenPermissions for Permissions {
 }
 /// Explicit setup adapter: scoped token, pinned projects, complete idle theme and selection.
 pub fn setup_with_paths(paths: T3Paths) -> Result<()> {
-    let root = std::env::var_os("DISTRACTION_WORKSPACE_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or(state_dir()?.join("workspace"));
     let config = dt_t3::setup::SetupConfig {
         paths,
-        workspace_root: root,
+        workspace_root: workspace_root()?,
         idle_theme: idle_document()?,
     };
     let report = dt_t3::setup::setup_decks(&config, &Permissions)?;
@@ -128,13 +122,20 @@ pub fn setup_with_paths(paths: T3Paths) -> Result<()> {
     }
     Ok(())
 }
+fn workspace_root() -> Result<PathBuf> {
+    Ok(std::env::var_os("DISTRACTION_WORKSPACE_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or(state_dir()?.join("workspace")))
+}
 fn favicon(paths: T3Paths) -> Result<FaviconDriver> {
     let api = dt_t3::api::T3Api::new(paths)?;
+    let root = workspace_root()?;
     let project = api
-        .find_project("GlowTube", None)?
+        .find_project("GlowTube", Some(&root))?
         .ok_or(Error::Protocol("GlowTube project missing; run setup"))?;
     let project_b = api
-        .find_project("GlowTube B", None)?
+        .find_project("GlowTube B", Some(&root.join("deck-b")))?
+        .filter(|deck| deck.id != project.id)
         .map(|project| project.id);
     let clips_dir = state_dir()?.join("clips");
     let latency = std::env::var("GLOWTUBE_FAVICON_LATENCY")
@@ -155,15 +156,33 @@ fn favicon(paths: T3Paths) -> Result<FaviconDriver> {
                 .as_nanos()
         ),
         show_latency: latency,
+        first_clip: duration_setting("GLOWTUBE_FIRST_CLIP", 10.0)?,
+        clip_seconds: duration_setting("GLOWTUBE_CLIP_SECONDS", 22.0)?,
+        gate: std::env::var("GLOWTUBE_GATE").as_deref() != Ok("0"),
     };
     FaviconDriver::new(
         Box::new(dt_t3::favicon::FaviconScheduler::new(config)),
         Arc::new(NativeEffects {
-            encoder: encoder()?,
+            encoder: crate::encoder_process::EncoderProcess::new(
+                std::env::current_exe()?,
+                "ffmpeg".into(),
+            ),
             api,
             clips_dir,
         }),
     )
+}
+fn duration_setting(name: &str, default: f64) -> Result<Duration> {
+    let value = std::env::var(name)
+        .ok()
+        .map(|value| value.parse::<f64>())
+        .transpose()
+        .map_err(|_| Error::InvalidInput("invalid favicon duration"))?
+        .unwrap_or(default);
+    Duration::try_from_secs_f64(value)
+        .ok()
+        .filter(|d| !d.is_zero())
+        .ok_or(Error::InvalidInput("invalid favicon duration"))
 }
 /// Apply verified platform events; clipboard text is scanned only on a copied-link action.
 pub fn input_event(
@@ -326,8 +345,11 @@ pub fn play(urls: Vec<String>) -> Result<()> {
         let _ = watcher.stop();
     }
     let server_result = server.stop();
+    let favicon_result = favicon
+        .as_mut()
+        .map(|driver| driver.stop_for_player(&mut player))
+        .unwrap_or(Ok(()));
     let player_result = player.stop();
-    let favicon_result = favicon.as_mut().map(FaviconDriver::stop).unwrap_or(Ok(()));
     let write_result = writes.stop();
     // Final idle write also respects the most recent debounce/quiet deadline.
     writes.finish_idle()?;

@@ -38,6 +38,9 @@ pub enum Command {
     Service,
     /// Write the idle theme.
     Idle,
+    /// Private warmed codec process; receives bounded JSON jobs on stdin, never T3 commands.
+    #[command(hide = true)]
+    InternalEncodeFavicon,
 }
 
 /// Every command accepted by `glowtube.command`, with unchanged URL path spellings.

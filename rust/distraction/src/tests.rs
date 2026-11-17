@@ -29,6 +29,9 @@ struct AudioState {
     playing: AtomicBool,
     stopped: AtomicBool,
     source: Mutex<Option<Arc<PcmAudio>>>,
+    held: AtomicBool,
+    release: Mutex<Option<Instant>>,
+    wall: Mutex<Option<FakeWall>>,
 }
 struct FakeAudio(Arc<AudioState>);
 impl Clock for AudioState {
@@ -51,6 +54,26 @@ impl AudioOutput for FakeAudio {
     fn set_playing(&mut self, playing: bool) -> Result<()> {
         self.0.playing.store(playing, Ordering::SeqCst);
         Ok(())
+    }
+    fn hold(&mut self) -> Result<()> {
+        self.0.held.store(true, Ordering::SeqCst);
+        *self.0.release.lock().unwrap() = None;
+        Ok(())
+    }
+    fn release_at(&mut self, when: Instant) -> Result<()> {
+        *self.0.release.lock().unwrap() = Some(when);
+        Ok(())
+    }
+    fn gated(&self) -> bool {
+        let now = self
+            .0
+            .wall
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or_else(Instant::now, WallClock::now);
+        self.0.held.load(Ordering::SeqCst)
+            && self.0.release.lock().unwrap().is_none_or(|at| now < at)
     }
     fn seek(&mut self, position: Duration) -> Result<()> {
         self.0
@@ -179,9 +202,14 @@ struct RenderState {
     stops: AtomicUsize,
     cost_ms: AtomicU64,
     wall: Mutex<Option<FakeWall>>,
+    retained: Mutex<Vec<u64>>,
 }
 struct FakeVideo(Arc<RenderState>);
 impl VideoSource for FakeVideo {
+    fn begin_batch(&mut self, k: u64) -> Result<()> {
+        self.0.retained.lock().unwrap().push(k);
+        Ok(())
+    }
     fn get(&mut self, k: u64) -> Result<Option<Arc<Frame>>> {
         if self.0.missing.load(Ordering::SeqCst) {
             return Ok(None);
@@ -286,6 +314,7 @@ impl AheadEncoder for FakeEncoder {
 type LoopFixture = (WriteLoop, FakeWall, Arc<RenderState>, Arc<SinkState>);
 fn write_loop(audio: Arc<AudioState>) -> LoopFixture {
     let wall = FakeWall::new();
+    *audio.wall.lock().unwrap() = Some(wall.clone());
     let renderer = Arc::new(RenderState::default());
     *renderer.wall.lock().unwrap() = Some(wall.clone());
     let sink = Arc::new(SinkState::default());
@@ -910,7 +939,7 @@ fn favicon_bridge_never_publishes_after_ordinary_write_or_before_settle() {
     use std::collections::VecDeque;
     struct FakeScheduler(Arc<Mutex<VecDeque<Vec<FaviconAction>>>>);
     impl Scheduler for FakeScheduler {
-        fn tick(&mut self, _: FaviconTick<'_>, _: u64) -> Result<Vec<FaviconAction>> {
+        fn tick(&mut self, _: FaviconTick<'_>) -> Result<Vec<FaviconAction>> {
             Ok(self.0.lock().unwrap().pop_front().unwrap_or_default())
         }
         fn stop(&mut self) -> Vec<FaviconAction> {
@@ -927,7 +956,7 @@ fn favicon_bridge_never_publishes_after_ordinary_write_or_before_settle() {
         blanks: AtomicUsize,
     }
     impl FaviconEffects for Effects {
-        fn encode(&self, job: ClipJob) -> Result<ReadyClip> {
+        fn encode(&self, job: ClipJob, _: &crate::favicon::EncodeEpoch) -> Result<ReadyClip> {
             Ok(ReadyClip { job, frames: 144 })
         }
         fn publish(&self, project: &str, _: &std::path::Path) -> Result<()> {
@@ -1103,6 +1132,7 @@ fn covered_batches_use_one_video_frame_and_sixty_glow_and_value_frames() {
         assert!(b.values[59].contains_key("pr"));
     }
     assert_eq!(writes.timing.next_frame, Some(48));
+    assert_eq!(*renderer.retained.lock().unwrap(), [0]);
     assert_eq!(writes.until_next(), Duration::from_secs(2));
     wall.advance(2000);
     assert!(!writes.tick(&mut p).unwrap());
@@ -1117,6 +1147,195 @@ fn covered_batches_use_one_video_frame_and_sixty_glow_and_value_frames() {
     assert_eq!(writes.timing.step_frames, 6);
     writes.timing.next_frame = Some(1000);
     assert_eq!(writes.until_next(), Duration::from_millis(500));
+}
+
+#[test]
+fn audio_hold_has_a_failsafe_and_scheduled_release_without_unpausing() {
+    let (mut p, audio, _) = player(&["a"]);
+    let (_, wall, _, _) = write_loop(audio.clone());
+    audio.millis.store(1234, Ordering::SeqCst);
+    let deadline = wall.now() + dt_t3::favicon::GATE_MAX;
+    assert_eq!(p.hold_audio(deadline).unwrap(), Duration::from_millis(1234));
+    assert_eq!(*audio.release.lock().unwrap(), Some(deadline));
+    assert!(p.status().held);
+    wall.advance(5999);
+    assert!(p.status().held);
+    wall.advance(1);
+    assert!(!p.status().held); // No scheduler tick is needed to release.
+    p.hold_audio(wall.now() + Duration::from_secs(6)).unwrap();
+    p.set_playing(false).unwrap();
+    p.release_audio(Some(wall.now() + Duration::from_millis(300)))
+        .unwrap();
+    wall.advance(299);
+    assert!(p.held());
+    wall.advance(1);
+    assert!(!p.held());
+    assert!(!p.playing);
+}
+
+#[test]
+fn real_scheduler_holds_replaces_on_seek_allows_and_publishes_then_releases() {
+    use crate::favicon::{EncodeEpoch, FaviconDriver, FaviconEffects};
+    use dt_t3::favicon::*;
+    struct Effects {
+        jobs: mpsc::Sender<ClipJob>,
+        first: AtomicBool,
+        cancelled: (Mutex<bool>, std::sync::Condvar),
+        replacements: AtomicUsize,
+        publications: AtomicUsize,
+    }
+    impl FaviconEffects for Effects {
+        fn encode(&self, job: ClipJob, _: &EncodeEpoch) -> Result<ReadyClip> {
+            self.jobs.send(job.clone()).unwrap();
+            if !self.first.swap(true, Ordering::SeqCst) {
+                let (mutex, wake) = &self.cancelled;
+                let mut cancelled = mutex.lock().unwrap();
+                while !*cancelled {
+                    cancelled = wake.wait(cancelled).unwrap();
+                }
+                return Err(Error::Protocol("cancelled first encode"));
+            }
+            let frames = (job.duration.as_secs_f64() * 24.0).round() as u64;
+            Ok(ReadyClip { job, frames })
+        }
+        fn cancel_encoder(&self) -> Result<()> {
+            self.replacements.fetch_add(1, Ordering::SeqCst);
+            *self.cancelled.0.lock().unwrap() = true;
+            self.cancelled.1.notify_all();
+            Ok(())
+        }
+        fn publish(&self, project: &str, _: &std::path::Path) -> Result<()> {
+            assert_eq!(project, "deck-a");
+            self.publications.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn blank(&self, _: &str, _: &std::path::Path) -> Result<()> {
+            Ok(())
+        }
+        fn cleanup(&self, _: &std::path::Path, _: usize) -> Result<()> {
+            Ok(())
+        }
+    }
+    let (mut p, audio, _) = player(&["a"]);
+    p.offset = 0.0;
+    p.output_latency = Duration::from_millis(200);
+    audio.millis.store(1000, Ordering::SeqCst);
+    let (mut writes, wall, _, _) = write_loop(audio.clone());
+    let (jobs, receive) = mpsc::channel();
+    let effects = Arc::new(Effects {
+        jobs,
+        first: AtomicBool::new(false),
+        cancelled: (Mutex::new(false), std::sync::Condvar::new()),
+        replacements: AtomicUsize::new(0),
+        publications: AtomicUsize::new(0),
+    });
+    let scheduler = FaviconScheduler::new(FaviconConfig {
+        clips_dir: std::env::temp_dir(),
+        project_id: "deck-a".into(),
+        deck_b_project_id: Some("deck-b".into()),
+        run_id: "test".into(),
+        show_latency: Duration::from_millis(500),
+        first_clip: Duration::from_secs(10),
+        clip_seconds: Duration::from_secs(22),
+        gate: true,
+    });
+    let mut driver = FaviconDriver::new(Box::new(scheduler), effects.clone()).unwrap();
+    writes.synchronize(&p).unwrap();
+    driver.tick(&mut p, &mut writes, wall.now()).unwrap();
+    assert!(p.held());
+    driver.tick(&mut p, &mut writes, wall.now()).unwrap();
+    let old = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(old.start, Duration::from_secs(1));
+    p.seek(0.5).unwrap();
+    writes.synchronize(&p).unwrap();
+    driver.tick(&mut p, &mut writes, wall.now()).unwrap();
+    assert_eq!(effects.replacements.load(Ordering::SeqCst), 1);
+    assert!(p.held());
+    driver.tick(&mut p, &mut writes, wall.now()).unwrap();
+    let new = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(new.start, Duration::from_millis(1500));
+    assert_ne!(old.output, new.output);
+    wall.advance(250);
+    eventually(|| {
+        driver.tick(&mut p, &mut writes, wall.now()).unwrap();
+        p.dirty = true;
+        writes.tick(&mut p).unwrap();
+        writes.quiet_written_at().is_some()
+    });
+    let landed = wall.now();
+    let allowed = p.favicon_allow.as_ref().unwrap();
+    assert!(
+        allowed
+            .iter()
+            .any(|name| new.output.file_name().unwrap() == name.as_str())
+    );
+    assert!(
+        allowed
+            .iter()
+            .all(|name| old.output.file_name().unwrap() != name.as_str())
+    );
+    wall.advance(449);
+    driver.tick(&mut p, &mut writes, wall.now()).unwrap();
+    assert_eq!(effects.publications.load(Ordering::SeqCst), 0);
+    wall.advance(1);
+    eventually(|| {
+        driver.tick(&mut p, &mut writes, wall.now()).unwrap();
+        p.favicon_front == Some('a')
+    });
+    assert_eq!(effects.publications.load(Ordering::SeqCst), 1);
+    assert!(p.favicon_live);
+    assert_eq!(
+        *audio.release.lock().unwrap(),
+        Some(landed + Duration::from_millis(750))
+    );
+    wall.advance(299);
+    assert!(p.status().held);
+    wall.advance(1);
+    assert!(!p.status().held);
+    driver.stop_for_player(&mut p).unwrap();
+}
+
+#[test]
+fn real_native_renderer_builds_a_covered_theme_and_budgets_favicon_css() {
+    use crate::write_loop::NativeRenderer;
+    let fonts = tempfile::tempdir().unwrap();
+    let mut renderer = NativeRenderer::new(
+        Arc::new(dt_render::encode::NativeAvifEncoder),
+        dt_render::card::CardRenderOptions {
+            fonts_dir: fonts.path().into(),
+        },
+        "unused-ffmpeg".into(),
+    );
+    let frame = Arc::new(Frame::new(640, 360, vec![40; 640 * 360 * 3]).unwrap());
+    let glow = Arc::new(Frame::new(128, 72, vec![20; 128 * 72 * 3]).unwrap());
+    let values = vec![[("bs".into(), "0.10".into())].into(); 60];
+    let extra =
+        crate::write_loop::favicon_css(Some('b'), Some(&["glowtube-clip-b-test-1.svg".into()]))
+            .unwrap();
+    let theme = renderer
+        .build(
+            CardContent {
+                title: "Synthetic".into(),
+                subtitle: "0:00 / 0:10".into(),
+                playing: true,
+                upcoming: vec![],
+            },
+            RenderBatch {
+                frames: &[frame],
+                glows: &vec![glow; 60],
+                values: &values,
+                playing: true,
+                chaos: 11.0,
+                prepared: None,
+                cheap: true,
+                extra_css: &extra,
+            },
+        )
+        .unwrap();
+    assert!(theme.css.contains(&extra));
+    assert!(theme.css.contains("2.500s linear"));
+    assert!(theme.css.encode_utf16().count() <= CSS_LIMIT);
+    assert!(renderer.quality().contains("speed 10"));
 }
 
 #[test]
@@ -1140,7 +1359,8 @@ fn covered_quiet_batch_has_still_video_and_animated_glow() {
 #[test]
 fn held_audio_builds_at_the_frozen_position_without_advancing_the_grid() {
     let (mut p, audio, _) = player(&["a"]);
-    p.held = true;
+    p.hold_audio(Instant::now() + Duration::from_secs(60))
+        .unwrap();
     p.offset = 0.8;
     audio.millis.store(1500, Ordering::SeqCst);
     let (mut writes, wall, renderer, _) = write_loop(audio);
@@ -1163,7 +1383,8 @@ fn held_audio_builds_at_the_frozen_position_without_advancing_the_grid() {
 #[test]
 fn unchanged_held_batch_grants_only_when_tagged_for_a_quiet_window() {
     let (mut p, audio, _) = player(&["a"]);
-    p.held = true;
+    p.hold_audio(Instant::now() + Duration::from_secs(60))
+        .unwrap();
     let (mut writes, wall, renderer, sink) = write_loop(audio);
     renderer.unchanged.store(true, Ordering::SeqCst);
     assert!(writes.tick(&mut p).unwrap());
@@ -1244,11 +1465,11 @@ fn scheduler_bridge_receives_jump_counter_and_landed_quiet_time_and_sets_front()
         snapshots: Snapshots,
     }
     impl Scheduler for Capture {
-        fn tick(&mut self, input: FaviconTick<'_>, jumps: u64) -> Result<Vec<FaviconAction>> {
+        fn tick(&mut self, input: FaviconTick<'_>) -> Result<Vec<FaviconAction>> {
             self.snapshots
                 .lock()
                 .unwrap()
-                .push((jumps, input.quiet_granted_at));
+                .push((input.jumps, input.quiet_granted_at));
             Ok(vec![
                 FaviconAction::SetFront(Some(Deck::B)),
                 FaviconAction::SetLive(true),
@@ -1260,7 +1481,7 @@ fn scheduler_bridge_receives_jump_counter_and_landed_quiet_time_and_sets_front()
     }
     struct NoEffects;
     impl FaviconEffects for NoEffects {
-        fn encode(&self, _: ClipJob) -> Result<ReadyClip> {
+        fn encode(&self, _: ClipJob, _: &crate::favicon::EncodeEpoch) -> Result<ReadyClip> {
             panic!("unexpected encode")
         }
         fn publish(&self, _: &str, _: &std::path::Path) -> Result<()> {
@@ -1396,10 +1617,10 @@ fn native_favicon_effects_use_explicit_projects_and_owned_paths_against_a_mock_a
     .unwrap();
     std::fs::write(&paths.token_file, "fake-test-token").unwrap();
     let effects = NativeEffects {
-        encoder: dt_render::encode::FfmpegAvifEncoder {
-            ffmpeg: "unused-ffmpeg".into(),
-            work_dir: temp.path().join("encode"),
-        },
+        encoder: crate::encoder_process::EncoderProcess::new(
+            "unused-worker".into(),
+            "unused-ffmpeg".into(),
+        ),
         api: dt_t3::api::T3Api::new(paths).unwrap(),
         clips_dir: temp.path().join("clips"),
     };

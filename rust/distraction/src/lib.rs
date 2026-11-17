@@ -3,6 +3,7 @@
 pub mod ahead_pool;
 pub mod cli;
 pub mod control;
+pub mod encoder_process;
 pub mod favicon;
 pub mod player;
 pub mod runtime;
@@ -29,5 +30,6 @@ pub fn run(cli: cli::Cli) -> Result<()> {
         cli::Command::Setup => runtime::setup_with_paths(dt_t3::T3Paths::discover()?),
         cli::Command::Service => supervisor::serve(),
         cli::Command::Idle => runtime::idle(),
+        cli::Command::InternalEncodeFavicon => encoder_process::serve(),
     }
 }

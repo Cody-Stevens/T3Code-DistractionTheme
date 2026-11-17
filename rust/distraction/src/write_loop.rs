@@ -99,7 +99,6 @@ pub struct NativeRenderer {
     pub ffmpeg: std::path::PathBuf,
     state: DynamicState,
     card: Option<(CardContent, Card)>,
-    measure: bool,
 }
 impl NativeRenderer {
     /// Construct without opening video or drawing anything.
@@ -114,7 +113,6 @@ impl NativeRenderer {
             ffmpeg,
             state: DynamicState::default(),
             card: None,
-            measure: std::env::var_os("GLOWTUBE_MEASURE").is_some_and(|value| !value.is_empty()),
         }
     }
     fn card(&mut self, content: CardContent) -> Result<&Card> {
@@ -143,12 +141,6 @@ impl Renderer for NativeRenderer {
     }
     fn build(&mut self, content: CardContent, input: RenderBatch<'_>) -> Result<BuiltTheme> {
         let card = self.card(content)?.clone();
-        let mut extra_css = input.extra_css.to_owned();
-        if self.measure {
-            extra_css.push_str(
-                r#"[data-workspace-area="conversation"]::after{background:#ff00ff!important}"#,
-            );
-        }
         dt_render::css::build_dynamic(
             self.encoder.as_ref(),
             &mut self.state,
@@ -161,13 +153,14 @@ impl Renderer for NativeRenderer {
                 chaos: input.chaos,
                 prepared: input.prepared,
                 cheap: input.cheap,
-                extra_css: &extra_css,
+                extra_css: input.extra_css,
             },
         )
     }
     fn idle(&mut self, content: CardContent, extra_css: &str) -> Result<BuiltTheme> {
         let mut css = dt_render::css::idle_theme(self.card(content)?)?;
         css.push_str(extra_css);
+        css.push_str(&dt_render::css::diagnostic_css_from_env());
         Ok(BuiltTheme {
             css,
             video_room: 30000,
@@ -300,7 +293,7 @@ impl WriteLoop {
             }
             self.revision = Some(player.revision);
         }
-        let moving = player.playing && !player.held;
+        let moving = player.playing && !player.held();
         if self.playing != moving {
             self.timing.next_frame = None;
             self.ahead.clear();
@@ -325,7 +318,7 @@ impl WriteLoop {
         }
         let is_quiet = self.quiet_requested;
         self.batch_quiet = is_quiet;
-        let moving = player.playing && !player.held;
+        let moving = player.playing && !player.held();
         let covered = moving && player.favicon_live && !is_quiet;
         let step = if covered {
             COVERED_STEP
@@ -365,6 +358,10 @@ impl WriteLoop {
             k0 = prepared.key.start_frame;
         }
         let end = (k0 + count).min(track.info.frames);
+        self.reader
+            .as_mut()
+            .expect("video source")
+            .begin_batch(k0)?;
         let mut frames = vec![];
         let mut glows = vec![];
         let mut values = vec![];
@@ -669,34 +666,16 @@ impl Drop for WriteLoop {
         let _ = self.stop();
     }
 }
-/// Measured Python selector; carried even by idle writes while a deck is selected.
-pub fn front_css(deck: Option<char>) -> String {
-    match deck {
-        Some(deck @ ('a' | 'b')) => {
-            format!(
-                "img[src*=\"glowtube-clip-\"]{{opacity:.01!important}}img[src*=\"glowtube-clip-{deck}-\"]{{opacity:1!important;z-index:2147483001!important}}"
-            )
-        }
-        _ => String::new(),
-    }
-}
-
-/// Complete per-write favicon rules, including Python's stale-file visibility filter.
+/// Complete per-write favicon rules supplied by dt-render.
 pub fn favicon_css(front: Option<char>, allowed: Option<&[String]>) -> Result<String> {
-    let mut css = front_css(front);
+    let mut css = match front {
+        Some(deck) => dt_render::css::favicon_front_css(deck)?,
+        None => String::new(),
+    };
     if let Some(files) = allowed {
-        css.push_str("img[src*=\"glowtube-clip-\"]");
-        for name in files {
-            if name.is_empty()
-                || !name
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
-            {
-                return Err(Error::InvalidInput("invalid favicon basename"));
-            }
-            css.push_str(&format!(":not([src*=\"{name}\"])"));
-        }
-        css.push_str("{visibility:hidden!important}");
+        css.push_str(&dt_render::css::favicon_allow_css(
+            &files.iter().map(String::as_str).collect::<Vec<_>>(),
+        )?);
     }
     Ok(css)
 }

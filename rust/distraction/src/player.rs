@@ -82,8 +82,8 @@ pub struct Player {
     pub index: usize,
     /// Playback enabled, including while the source is loading.
     pub playing: bool,
-    /// Music is held at its current position while the first favicon clip loads.
-    pub held: bool,
+    /// Device buffering latency used to align audio release with the first favicon picture.
+    pub output_latency: Duration,
     /// Main-loop lifetime flag.
     pub running: bool,
     /// Clamped gain.
@@ -124,8 +124,13 @@ impl Player {
     /// Open the native output and start independent metadata and lazy-load workers.
     pub fn new(urls: Vec<String>) -> Result<Self> {
         let loader = NativeLoader(crate::runtime::download_config()?);
-        let audio = dt_media::CpalOutput::open(&dt_media::AudioOutputConfig::default())?;
-        Self::with_dependencies(urls, Arc::new(loader), Box::new(audio))
+        let mut audio = dt_media::CpalOutput::open(&dt_media::AudioOutputConfig::default())?;
+        // The acknowledgement guarantees a backend callback has published its latency estimate.
+        audio.set_playing(false)?;
+        let latency = audio.device_latency();
+        let mut player = Self::with_dependencies(urls, Arc::new(loader), Box::new(audio))?;
+        player.output_latency = latency;
+        Ok(player)
     }
     /// Construct with fake media/output without touching devices, T3, or control ports.
     pub fn with_dependencies(
@@ -152,7 +157,7 @@ impl Player {
             serial: 0,
             index: 0,
             playing: true,
-            held: false,
+            output_latency: Duration::ZERO,
             running: true,
             volume,
             chaos: 11.0,
@@ -184,6 +189,27 @@ impl Player {
     /// Clone the audible clock handle; it never executes loading/rendering work.
     pub fn clock(&self) -> Arc<dyn Clock> {
         Arc::new(self.audio.clone())
+    }
+    /// Query the output's actual hold/deadline state, including releases between owner ticks.
+    pub fn held(&self) -> bool {
+        self.output(|audio| Ok(audio.gated())).unwrap_or(false)
+    }
+    /// Freeze the native cursor and arm its independent failsafe before acknowledging the position.
+    pub fn hold_audio(&mut self, deadline: Instant) -> Result<Duration> {
+        let position = self.output(|audio| {
+            audio.hold()?;
+            let position = audio.media_time();
+            audio.release_at(deadline)?;
+            Ok(position)
+        })?;
+        self.dirty = true;
+        Ok(position)
+    }
+    /// Replace the failsafe with the picture's deadline, or release immediately.
+    pub fn release_audio(&mut self, at: Option<Instant>) -> Result<()> {
+        self.output(|audio| audio.release_at(at.unwrap_or_else(Instant::now)))?;
+        self.dirty = true;
+        Ok(())
     }
     fn output<T>(&self, apply: impl FnOnce(&mut dyn AudioOutput) -> Result<T>) -> Result<T> {
         let mut audio = self
@@ -313,7 +339,7 @@ impl Player {
             .track()
             .is_some_and(|t| matches!(t.state, LoadState::Failed));
         let ended = self.source_id.is_some() && self.output(|a| Ok(a.ended()))?;
-        if (self.playing && !self.held && ended) || (failed && self.queue.len() > 1) {
+        if (self.playing && !self.held() && ended) || (failed && self.queue.len() > 1) {
             self.jump(1)?;
         }
         self.evict();
@@ -495,7 +521,7 @@ impl Player {
             chaos: self.chaos,
             offset: (self.offset * 1000.0).round_ties_even() / 1000.0,
             quality: self.quality.clone(),
-            held: self.held,
+            held: self.held(),
             front: self.favicon_front.map(|front| front.to_string()),
         }
     }

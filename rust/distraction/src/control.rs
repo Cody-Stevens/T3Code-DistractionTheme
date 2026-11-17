@@ -238,6 +238,8 @@ fn respond(
     stop: &AtomicBool,
 ) -> Result<()> {
     use std::io::{Read, Write};
+    // Windows can inherit nonblocking mode from the listener; use bounded blocking IO here.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_millis(25)))?;
     stream.set_write_timeout(Some(Duration::from_millis(100)))?;
     let deadline = Instant::now() + CONTROL_TIMEOUT;

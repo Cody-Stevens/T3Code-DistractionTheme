@@ -5,8 +5,9 @@ use dt_t3::favicon::*;
 use std::{
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
+        mpsc,
     },
     time::Instant,
 };
@@ -14,13 +15,12 @@ use std::{
 /// Injectable scheduler boundary, including fake late quiet requests.
 pub trait Scheduler {
     /// Advance from a snapshot and completed effects.
-    fn tick(&mut self, input: FaviconTick<'_>, jumps: u64) -> Result<Vec<FaviconAction>>;
+    fn tick(&mut self, input: FaviconTick<'_>) -> Result<Vec<FaviconAction>>;
     /// Request final cancellation/blanking.
     fn stop(&mut self) -> Vec<FaviconAction>;
 }
 impl Scheduler for FaviconScheduler {
-    fn tick(&mut self, input: FaviconTick<'_>, _jumps: u64) -> Result<Vec<FaviconAction>> {
-        // The dt-t3 seek-counter follow-up adds this input to its public snapshot.
+    fn tick(&mut self, input: FaviconTick<'_>) -> Result<Vec<FaviconAction>> {
         self.tick(input)
     }
     fn stop(&mut self) -> Vec<FaviconAction> {
@@ -29,14 +29,46 @@ impl Scheduler for FaviconScheduler {
 }
 /// Blocking favicon effects; only encode/API worker threads call these during playback.
 pub trait FaviconEffects: Send + Sync {
+    /// Warm an isolated encoder; called only on its worker thread.
+    fn warm_encoder(&self, _epoch: &EncodeEpoch) -> Result<()> {
+        Ok(())
+    }
     /// Encode a clip on its independent worker.
-    fn encode(&self, job: ClipJob) -> Result<ReadyClip>;
+    fn encode(&self, job: ClipJob, epoch: &EncodeEpoch) -> Result<ReadyClip>;
+    /// Interrupt the active encoder/decoder tree before joining and replacing its worker.
+    fn cancel_encoder(&self) -> Result<()> {
+        Ok(())
+    }
     /// Publish the selected deck's asset path.
     fn publish(&self, project_id: &str, path: &Path) -> Result<()>;
     /// Clear the selected deck with a tiny owned blank SVG.
     fn blank(&self, project_id: &str, path: &Path) -> Result<()>;
     /// Retain the requested number of owned clip files for late client downloads.
     fn cleanup(&self, clips_dir: &Path, keep: usize) -> Result<()>;
+}
+/// Cancellation epoch shared with the native process adapter, checked atomically before spawning.
+#[derive(Clone)]
+pub struct EncodeEpoch {
+    generation: Arc<AtomicU64>,
+    expected: u64,
+}
+impl Default for EncodeEpoch {
+    fn default() -> Self {
+        Self {
+            generation: Arc::new(AtomicU64::new(0)),
+            expected: 0,
+        }
+    }
+}
+impl EncodeEpoch {
+    /// False after queued/running work has been invalidated by the scheduler.
+    pub fn current(&self) -> bool {
+        self.generation.load(Ordering::Acquire) == self.expected
+    }
+}
+enum EncodeJob {
+    Warm(u64),
+    Clip(u64, ClipJob),
 }
 enum ApiJob {
     Publish(String, PathBuf, Instant),
@@ -49,7 +81,10 @@ type ApiAnswer = (u64, Option<FaviconEvent>);
 pub struct FaviconDriver {
     scheduler: Box<dyn Scheduler>,
     effects: Arc<dyn FaviconEffects>,
-    encode: Worker<(u64, ClipJob), EncodeAnswer>,
+    encode: Worker<EncodeJob, EncodeAnswer>,
+    started: mpsc::Receiver<EncodeAnswer>,
+    starts: mpsc::Sender<EncodeAnswer>,
+    start_barrier: Arc<Mutex<()>>,
     api: Worker<(u64, ApiJob), ApiAnswer>,
     generation: Arc<AtomicU64>,
     deferred: Vec<FaviconEvent>,
@@ -59,18 +94,14 @@ impl FaviconDriver {
     /// Construct with native or fake scheduler/effects; starts no media until asked by tick.
     pub fn new(scheduler: Box<dyn Scheduler>, effects: Arc<dyn FaviconEffects>) -> Result<Self> {
         let generation = Arc::new(AtomicU64::new(0));
-        let enc_effects = effects.clone();
-        let enc_gen = generation.clone();
-        let encode = Worker::start(1, move |(generation, job): (u64, ClipJob)| {
-            if generation != enc_gen.load(Ordering::Acquire) {
-                return (generation, None);
-            }
-            let event = match enc_effects.encode(job.clone()) {
-                Ok(clip) => FaviconEvent::Encoded(clip),
-                Err(_) => FaviconEvent::EncodeFailed(job),
-            };
-            (generation, Some(event))
-        })?;
+        let (starts, started) = mpsc::channel();
+        let start_barrier = Arc::new(Mutex::new(()));
+        let encode = Self::encoder(
+            effects.clone(),
+            generation.clone(),
+            starts.clone(),
+            start_barrier.clone(),
+        )?;
         let api_effects = effects.clone();
         let api_gen = generation.clone();
         let api = Worker::start(8, move |(generation, job)| {
@@ -101,11 +132,55 @@ impl FaviconDriver {
             scheduler,
             effects,
             encode,
+            started,
+            starts,
+            start_barrier,
             api,
             generation,
             deferred: vec![],
             stopped: false,
         })
+    }
+    fn encoder(
+        effects: Arc<dyn FaviconEffects>,
+        generation: Arc<AtomicU64>,
+        starts: mpsc::Sender<EncodeAnswer>,
+        barrier: Arc<Mutex<()>>,
+    ) -> Result<Worker<EncodeJob, EncodeAnswer>> {
+        let expected = generation.load(Ordering::Acquire);
+        let worker = Worker::start(3, move |request| {
+            let (expected, job) = match request {
+                EncodeJob::Warm(expected) => {
+                    let epoch = EncodeEpoch {
+                        generation: generation.clone(),
+                        expected,
+                    };
+                    if epoch.current() {
+                        let _ = effects.warm_encoder(&epoch);
+                    }
+                    return (expected, None);
+                }
+                EncodeJob::Clip(expected, job) => (expected, job),
+            };
+            let epoch = EncodeEpoch {
+                generation: generation.clone(),
+                expected,
+            };
+            {
+                let _start = barrier.lock().expect("encoder start barrier");
+                if !epoch.current() {
+                    return (expected, None);
+                }
+                let _ = starts.send((expected, Some(FaviconEvent::EncodeStarted(job.clone()))));
+            }
+            let event = match effects.encode(job.clone(), &epoch) {
+                Ok(clip) => FaviconEvent::Encoded(clip),
+                Err(_) => FaviconEvent::EncodeFailed(job),
+            };
+            (expected, Some(event))
+        })?;
+        worker.submit(EncodeJob::Warm(expected))?;
+        Ok(worker)
     }
     /// About 100 ms per tick; HTTP/encode work never blocks the write owner.
     pub fn tick(
@@ -114,44 +189,78 @@ impl FaviconDriver {
         writes: &mut WriteLoop,
         now: Instant,
     ) -> Result<()> {
+        // A worker cannot cross from queued to running between the snapshot and cancellation.
+        let start = self
+            .start_barrier
+            .lock()
+            .map_err(|_| Error::Protocol("encoder start barrier failed"))?;
         let mut events = std::mem::take(&mut self.deferred);
         let generation = self.generation.load(Ordering::Acquire);
-        for (epoch, event) in self
-            .encode
-            .replies
-            .try_iter()
-            .chain(self.api.replies.try_iter())
-        {
+        for (epoch, event) in self.started.try_iter().chain(
+            self.encode
+                .replies
+                .try_iter()
+                .chain(self.api.replies.try_iter()),
+        ) {
             if epoch == generation
                 && let Some(event) = event
             {
                 events.push(event);
             }
         }
-        let actions = self.scheduler.tick(
-            FaviconTick {
-                track: player.ready().map(|t| &t.info),
-                media_time: player.clock().media_time(),
-                wall_time: now,
-                playing: player.playing,
-                enabled: player.favicon_enabled,
-                quiet_granted_at: writes.quiet_written_at(),
-                events,
-            },
-            player.jumps,
-        )?;
+        let actions = self.scheduler.tick(FaviconTick {
+            track: player.ready().map(|t| &t.info),
+            media_time: player.clock().media_time(),
+            jumps: player.jumps,
+            wall_time: now,
+            playing: player.playing,
+            enabled: player.favicon_enabled,
+            output_latency: player.output_latency,
+            quiet_granted_at: writes.quiet_written_at(),
+            events,
+        })?;
+        if actions
+            .iter()
+            .any(|a| matches!(a, FaviconAction::CancelPending))
+        {
+            self.generation.fetch_add(1, Ordering::AcqRel);
+            self.deferred.clear();
+        }
+        drop(start);
         for action in actions {
             let generation = self.generation.load(Ordering::Acquire);
             match action {
                 FaviconAction::Encode(job) => {
-                    if self.encode.submit((generation, job.clone())).is_err() {
+                    if self
+                        .encode
+                        .submit(EncodeJob::Clip(generation, job.clone()))
+                        .is_err()
+                    {
                         self.deferred.push(FaviconEvent::EncodeFailed(job));
                     }
                 }
-                FaviconAction::CancelPending => {
-                    self.generation.fetch_add(1, Ordering::AcqRel);
-                    self.deferred.clear();
+                FaviconAction::CancelPending => (),
+                FaviconAction::ReplaceEncoder => {
+                    self.effects.cancel_encoder()?;
+                    self.encode.stop()?;
+                    self.encode = Self::encoder(
+                        self.effects.clone(),
+                        self.generation.clone(),
+                        self.starts.clone(),
+                        self.start_barrier.clone(),
+                    )?;
                 }
+                FaviconAction::HoldAudio {
+                    request_id,
+                    deadline,
+                } => {
+                    let media_time = player.hold_audio(deadline)?;
+                    self.deferred.push(FaviconEvent::AudioHeld {
+                        request_id,
+                        media_time,
+                    });
+                }
+                FaviconAction::ReleaseAudio { at } => player.release_audio(at)?,
                 FaviconAction::RequestQuiet => writes.request_quiet(),
                 FaviconAction::Publish {
                     project_id, path, ..
@@ -194,6 +303,19 @@ impl FaviconDriver {
                         player.dirty = true;
                     }
                 }
+                FaviconAction::SetAllowedFiles(files) => {
+                    let files: Vec<_> = files
+                        .iter()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect();
+                    dt_render::css::favicon_allow_css(
+                        &files.iter().map(String::as_str).collect::<Vec<_>>(),
+                    )?;
+                    if player.favicon_allow.as_ref() != Some(&files) {
+                        player.favicon_allow = Some(files);
+                        player.dirty = true;
+                    }
+                }
                 FaviconAction::SetLive(live) => {
                     if player.favicon_live != live {
                         player.dirty = true;
@@ -215,6 +337,7 @@ impl FaviconDriver {
         self.stopped = true;
         let actions = self.scheduler.stop();
         self.generation.fetch_add(1, Ordering::AcqRel);
+        let cancelled = self.effects.cancel_encoder();
         let encoding = self.encode.stop();
         let api = self.api.stop();
         let mut blank = Ok(());
@@ -229,7 +352,13 @@ impl FaviconDriver {
                 }
             }
         }
-        encoding.and(api).and(blank)
+        cancelled.and(encoding).and(api).and(blank)
+    }
+    /// Release music before stopping the driver, even if its scheduler had a pending hold.
+    pub fn stop_for_player(&mut self, player: &mut Player) -> Result<()> {
+        let release = player.release_audio(None);
+        let stop = self.stop();
+        release.and(stop)
     }
 }
 impl Drop for FaviconDriver {
@@ -240,28 +369,26 @@ impl Drop for FaviconDriver {
 
 /// Native adapters; a missing back deck is reported when asked to publish to it.
 pub struct NativeEffects {
-    /// Favicon AVIF backend, separate from short-clip workers.
-    pub encoder: dt_render::encode::FfmpegAvifEncoder,
+    /// Separately owned native codec/decoder process, so seeks can interrupt busy work.
+    pub encoder: crate::encoder_process::EncoderProcess,
     /// Scoped authenticated T3 client (never logged).
     pub api: dt_t3::api::T3Api,
     /// Dedicated local clip directory.
     pub clips_dir: PathBuf,
 }
 impl FaviconEffects for NativeEffects {
-    fn encode(&self, job: ClipJob) -> Result<ReadyClip> {
-        let encoded = dt_render::encode::encode_clip_svg(
-            &self.encoder,
-            &dt_render::encode::FaviconEncodeRequest {
-                video: job.video.clone(),
-                start: job.start,
-                duration: job.duration,
-                output: job.output.clone(),
-            },
-        )?;
-        Ok(ReadyClip {
-            job,
-            frames: encoded.frames,
-        })
+    fn warm_encoder(&self, epoch: &EncodeEpoch) -> Result<()> {
+        self.encoder.warm(epoch)
+    }
+    fn encode(&self, job: ClipJob, epoch: &EncodeEpoch) -> Result<ReadyClip> {
+        if job.output.parent() != Some(self.clips_dir.as_path()) {
+            return Err(Error::InvalidInput("encode outside clip directory"));
+        }
+        std::fs::create_dir_all(&self.clips_dir)?;
+        self.encoder.encode(job, epoch)
+    }
+    fn cancel_encoder(&self) -> Result<()> {
+        self.encoder.cancel()
     }
     fn publish(&self, project_id: &str, path: &Path) -> Result<()> {
         self.api.update_project(
