@@ -30,6 +30,14 @@ pub trait AudioOutput: Clock {
     fn set_source(&mut self, pcm: Option<Arc<PcmAudio>>) -> Result<()>;
     /// Freeze/unfreeze audible media time and sample advancement.
     fn set_playing(&mut self, playing: bool) -> Result<()>;
+    /// Emit silence and freeze the PCM cursor/clock until a release is scheduled by the player.
+    /// Does not change playing state; source changes and seeks preserve the hold.
+    fn hold(&mut self) -> Result<()>;
+    /// Hold until this monotonic deadline, then allow PCM on the first callback at/after it.
+    /// A past deadline releases immediately on acknowledgement; this never unpauses playback.
+    fn release_at(&mut self, when: Instant) -> Result<()>;
+    /// Whether an indefinite hold or a future release deadline is still active.
+    fn gated(&self) -> bool;
     /// Seek to an absolute sample position clamped to source length, invalidating old clock state.
     fn seek(&mut self, position: Duration) -> Result<()>;
     /// Set gain in 0..=1.5, matching the player volume control.
@@ -60,9 +68,14 @@ struct Snapshot {
     latency: u64,
     running: bool,
     loaded: bool,
+    gate_release: u64,
 }
 
 impl Snapshot {
+    fn gated(self, now: u64) -> bool {
+        self.gate_release > now
+    }
+
     fn at(self, now: u64) -> Duration {
         let position = if self.running {
             sample_ns(self.start)
@@ -79,7 +92,7 @@ impl Snapshot {
 #[derive(Default)]
 struct Shared {
     version: AtomicU64,
-    fields: [AtomicU64; 8],
+    fields: [AtomicU64; 9],
     ack: AtomicU64,
     failed: AtomicBool,
 }
@@ -96,6 +109,7 @@ impl Shared {
             s.latency,
             u64::from(s.running),
             u64::from(s.loaded),
+            s.gate_release,
         ]) {
             field.store(value, SeqCst);
         }
@@ -118,6 +132,7 @@ impl Shared {
                 latency,
                 running,
                 loaded,
+                gate_release,
             ] = std::array::from_fn(|i| self.fields[i].load(SeqCst));
             if version == self.version.load(SeqCst) {
                 return Snapshot {
@@ -129,6 +144,7 @@ impl Shared {
                     latency,
                     running: running != 0,
                     loaded: loaded != 0,
+                    gate_release,
                 };
             }
         }
@@ -140,6 +156,8 @@ enum Control {
     Playing(bool),
     Seek(u64),
     Volume(f32),
+    Hold,
+    ReleaseAt(u64),
 }
 
 struct Commands {
@@ -154,6 +172,7 @@ struct Callback {
     floor: u64,
     playing: bool,
     volume: f32,
+    gate_release: Option<u64>,
     commands: Consumer<(u64, Control)>,
     retired: Producer<Arc<PcmAudio>>,
     shared: Arc<Shared>,
@@ -179,9 +198,11 @@ impl Callback {
                 }
                 Control::Playing(playing) => {
                     if self.playing != playing {
-                        let audible = sample_position(self.shared.snapshot().at(now));
-                        self.cursor = audible;
-                        self.floor = audible;
+                        // Held/paused cursors are already frozen at an exact sample boundary.
+                        if self.playing && self.gate_release.is_none() {
+                            self.cursor = sample_position(self.shared.snapshot().at(now));
+                        }
+                        self.floor = self.cursor;
                         self.playing = playing;
                         changed = true;
                     }
@@ -193,13 +214,29 @@ impl Callback {
                     changed = true;
                 }
                 Control::Volume(volume) => self.volume = volume,
+                Control::Hold => {
+                    self.gate_release = Some(u64::MAX);
+                    self.floor = self.cursor;
+                    changed = true;
+                }
+                Control::ReleaseAt(deadline) => {
+                    self.gate_release = Some(deadline);
+                    self.floor = self.cursor;
+                    changed = true;
+                }
             }
             ack = Some(serial);
+        }
+        if self.gate_release.is_some_and(|deadline| now >= deadline) {
+            self.gate_release = None;
+            self.floor = self.cursor;
+            changed = true;
         }
         out.fill(T::from_sample(0.0));
         let length = self.source.as_ref().map_or(0, |s| s.samples.len() as u64);
         let start = self.cursor;
         if self.playing
+            && self.gate_release.is_none()
             && let Some(pcm) = &self.source
         {
             for (dest, sample) in out
@@ -227,8 +264,9 @@ impl Callback {
                 length,
                 wall: now,
                 latency,
-                running: self.playing && self.source.is_some(),
+                running: self.playing && self.gate_release.is_none() && self.source.is_some(),
                 loaded: self.source.is_some(),
+                gate_release: self.gate_release.unwrap_or(0),
             });
         }
         if let Some(serial) = ack {
@@ -346,6 +384,7 @@ impl CpalOutput {
             floor: 0,
             playing: false,
             volume: 0.8,
+            gate_release: None,
             commands: consumer,
             retired: retire_producer,
             shared: Arc::clone(&shared),
@@ -437,6 +476,17 @@ impl AudioOutput for CpalOutput {
     fn set_playing(&mut self, playing: bool) -> Result<()> {
         self.control(Control::Playing(playing))
     }
+    fn hold(&mut self) -> Result<()> {
+        self.control(Control::Hold)
+    }
+    fn release_at(&mut self, when: Instant) -> Result<()> {
+        self.control(Control::ReleaseAt(nanos(
+            when.saturating_duration_since(self.origin),
+        )))
+    }
+    fn gated(&self) -> bool {
+        self.shared.snapshot().gated(nanos(self.origin.elapsed()))
+    }
     fn seek(&mut self, position: Duration) -> Result<()> {
         self.control(Control::Seek(sample_position(position)))
     }
@@ -495,6 +545,7 @@ mod tests {
                 floor: 0,
                 playing: false,
                 volume: 1.0,
+                gate_release: None,
                 commands,
                 retired,
                 shared: Arc::default(),
@@ -515,6 +566,7 @@ mod tests {
             latency: 10_000_000,
             running: true,
             loaded: true,
+            gate_release: 0,
         };
         assert_eq!(s.at(s.wall), Duration::from_millis(990));
         assert_eq!(s.at(s.wall + 15_000_000), Duration::from_millis(1005));
@@ -599,5 +651,179 @@ mod tests {
         let mut out = [0_i16; 8];
         cb.render(&mut out, 0, 0);
         assert_eq!(out, [-16386, 16384, 4, -4, 0, 0, 0, 0]);
+    }
+
+    fn apply(
+        cb: &mut Callback,
+        commands: &mut Producer<(u64, Control)>,
+        control: Control,
+        now: u64,
+    ) -> [i16; 960] {
+        let serial = cb.shared.ack.load(SeqCst) + 1;
+        commands.push((serial, control)).ok().unwrap();
+        let mut out = [1; 960];
+        cb.render(&mut out, now, 10_000_000);
+        assert_eq!(cb.shared.ack.load(SeqCst), serial);
+        out
+    }
+
+    #[test]
+    fn hold_silences_output_and_freezes_clock_until_the_release_callback() {
+        let (mut cb, mut commands, _) = fake();
+        cb.source = Some(Arc::new(PcmAudio {
+            samples: vec![[16384, -16384]; 48000],
+        }));
+        cb.playing = true;
+        assert_eq!(apply(&mut cb, &mut commands, Control::Hold, 0), [0; 960]);
+        let mut out = [1_i16; 960];
+        cb.render(&mut out, 1_000_000_000, 10_000_000);
+        assert_eq!(out, [0; 960]);
+        assert_eq!(cb.cursor, 0);
+        let held = cb.shared.snapshot();
+        assert!(held.gated(1_000_000_000));
+        assert_eq!(held.at(1_000_000_000), Duration::ZERO);
+        assert_eq!(held.at(60_000_000_000), Duration::ZERO);
+
+        assert_eq!(
+            apply(
+                &mut cb,
+                &mut commands,
+                Control::ReleaseAt(2_000_000_000),
+                1_500_000_000
+            ),
+            [0; 960]
+        );
+        cb.render(&mut out, 1_999_999_999, 10_000_000);
+        assert_eq!(out, [0; 960]);
+        assert_eq!(cb.cursor, 0);
+        let scheduled = cb.shared.snapshot();
+        assert!(scheduled.gated(1_999_999_999));
+        assert!(!scheduled.gated(2_000_000_000));
+        // Expiring a deadline cannot invent samples before the callback submits any.
+        assert_eq!(scheduled.at(2_005_000_000), Duration::ZERO);
+        cb.render(&mut out, 2_000_000_000, 10_000_000);
+        assert_eq!(&out[..4], &[16384, -16384, 16384, -16384]);
+        assert_eq!(cb.cursor, 480);
+        let released = cb.shared.snapshot();
+        assert!(!released.gated(2_000_000_000));
+        assert_eq!(released.at(2_000_000_000), Duration::ZERO);
+        assert_eq!(released.at(2_015_000_000), Duration::from_millis(5));
+    }
+
+    #[test]
+    fn source_seek_and_resume_preserve_hold_and_release_does_not_unpause() {
+        let (mut cb, mut commands, _) = fake();
+        apply(&mut cb, &mut commands, Control::Hold, 0);
+        let source = Arc::new(PcmAudio {
+            samples: vec![[123, -123]; 48000 * 4],
+        });
+        assert_eq!(
+            apply(
+                &mut cb,
+                &mut commands,
+                Control::Source(Some(source)),
+                10_000_000
+            ),
+            [0; 960]
+        );
+        assert_eq!(
+            apply(&mut cb, &mut commands, Control::Seek(96000), 20_000_000),
+            [0; 960]
+        );
+        assert_eq!(
+            apply(&mut cb, &mut commands, Control::Playing(true), 30_000_000),
+            [0; 960]
+        );
+        assert_eq!(cb.cursor, 96000);
+        assert_eq!(
+            cb.shared.snapshot().at(1_000_000_000),
+            Duration::from_secs(2)
+        );
+        apply(
+            &mut cb,
+            &mut commands,
+            Control::ReleaseAt(100_000_000),
+            40_000_000,
+        );
+        apply(&mut cb, &mut commands, Control::Playing(false), 50_000_000);
+        let mut out = [1_i16; 960];
+        cb.render(&mut out, 100_000_000, 10_000_000);
+        assert_eq!(out, [0; 960]);
+        assert!(!cb.playing);
+        assert!(!cb.shared.snapshot().gated(100_000_000));
+        assert_eq!(cb.cursor, 96000);
+        assert_eq!(
+            cb.shared.snapshot().at(1_000_000_000),
+            Duration::from_secs(2)
+        );
+
+        // A new resume hold can be installed before unpausing without losing the seek target.
+        apply(&mut cb, &mut commands, Control::Hold, 110_000_000);
+        assert_eq!(
+            apply(&mut cb, &mut commands, Control::Playing(true), 120_000_000),
+            [0; 960]
+        );
+        assert_eq!(cb.cursor, 96000);
+        let resumed = apply(
+            &mut cb,
+            &mut commands,
+            Control::ReleaseAt(130_000_000),
+            130_000_000,
+        );
+        assert_eq!(&resumed[..4], &[123, -123, 123, -123]);
+        assert_eq!(cb.cursor, 96480);
+        assert_eq!(
+            cb.shared.snapshot().at(145_000_000),
+            Duration::from_millis(2005)
+        );
+        apply(&mut cb, &mut commands, Control::Hold, 150_000_000);
+        let frozen_cursor = cb.cursor;
+        cb.render(&mut out, 2_000_000_000, 10_000_000);
+        assert_eq!(out, [0; 960]);
+        assert_eq!(cb.cursor, frozen_cursor);
+        assert_eq!(
+            cb.shared.snapshot().at(3_000_000_000),
+            Duration::from_millis(2010)
+        );
+    }
+
+    #[test]
+    fn holds_cancel_old_deadlines_and_past_deadlines_release_immediately() {
+        let (mut cb, mut commands, _) = fake();
+        cb.source = Some(Arc::new(PcmAudio {
+            samples: vec![[321, -321]; 48000],
+        }));
+        cb.playing = true;
+        apply(&mut cb, &mut commands, Control::Hold, 0);
+        apply(
+            &mut cb,
+            &mut commands,
+            Control::ReleaseAt(50_000_000),
+            10_000_000,
+        );
+        apply(
+            &mut cb,
+            &mut commands,
+            Control::ReleaseAt(100_000_000),
+            20_000_000,
+        );
+        let mut out = [1_i16; 960];
+        cb.render(&mut out, 50_000_000, 10_000_000);
+        assert_eq!(out, [0; 960]);
+        assert!(cb.shared.snapshot().gated(50_000_000));
+        apply(&mut cb, &mut commands, Control::Hold, 60_000_000);
+        cb.render(&mut out, 200_000_000, 10_000_000);
+        assert_eq!(out, [0; 960]);
+        assert_eq!(cb.cursor, 0);
+        assert!(cb.shared.snapshot().gated(200_000_000));
+        let released = apply(
+            &mut cb,
+            &mut commands,
+            Control::ReleaseAt(100_000_000),
+            210_000_000,
+        );
+        assert_eq!(&released[..4], &[321, -321, 321, -321]);
+        assert_eq!(cb.cursor, 480);
+        assert!(!cb.shared.snapshot().gated(210_000_000));
     }
 }
