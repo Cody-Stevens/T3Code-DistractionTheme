@@ -61,7 +61,8 @@ target\release\distraction.exe install
    `orchestration:operate`. The token is stored in `~\.secrets\t3code-distraction-theme\t3-token`,
    readable only by your user.
 2. Creates the two pinned GlowTube projects (rooted in `%LOCALAPPDATA%\GlowTube\workspace`) and an
-   idle thread for each, without sending any agent a message.
+   idle thread for each, without sending any agent a message. The threads are created through T3's
+   MCP endpoint with a separate 15-minute session that is revoked straight after.
 3. Writes the GlowTube theme and selects it.
 4. Copies `distraction.exe` and `distraction-service.exe` to `%LOCALAPPDATA%\GlowTube\bin`.
 5. Starts the windowless service now and at every sign-in (a per-user `Run` entry).

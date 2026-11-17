@@ -124,9 +124,11 @@ most of them are not documented by T3 Code.
 - Each favicon only renders inside a sidebar thread row, so each deck project needs one idle thread.
   `t3 thread start` always sends an agent message, so the Rust setup creates them through T3's HTTP
   MCP endpoint (`/mcp`, tool `t3_thread_launch` with no message), which starts no turn. That
-  endpoint only accepts sessions issued with `--subject mcp-client`; the helper's token is issued
-  that way, still with only the two orchestration scopes. Older tokens get 401 there and setup
-  reports that the threads must be made by hand.
+  endpoint only accepts sessions issued with `--subject mcp-client`, and T3 refuses those sessions
+  everywhere else, including the HTTP API the player uses. So the helper's long-lived token is a
+  generic session, and setup issues a separate 15-minute `mcp-client` session (same two scopes),
+  keeps it in memory, uses it for the two idle threads and revokes it at once. If that session
+  can't be issued, setup still does the rest and reports that the threads must be made by hand.
 - Measure coverage with `GLOWTUBE_MEASURE=1` (the theme paints the player magenta under the clips)
   and `tools/overlay_chart.py`.
 - Every client signed in to the T3 server downloads the clips (the favicon is server state).

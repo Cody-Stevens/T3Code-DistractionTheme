@@ -3,7 +3,10 @@ mod support;
 
 use dt_core::{Error, Result};
 use dt_t3::{
-    setup::{SetupConfig, TokenIssuer, TokenPermissions, ensure_token_with, setup_decks},
+    setup::{
+        McpSessionToken, SetupConfig, TokenIssuer, TokenPermissions, ensure_token_with,
+        setup_decks_with,
+    },
     theme::ThemeDocument,
 };
 use serde_json::{Value, json};
@@ -41,6 +44,29 @@ impl TokenIssuer for Issuer {
     fn issue(&self, _: &Path) -> Result<String> {
         self.calls.set(self.calls.get() + 1);
         Ok("fake-issued-token".into())
+    }
+}
+
+/// Issues a fake setup MCP session and records revocations.
+#[derive(Default)]
+struct McpIssuer {
+    issued: Cell<usize>,
+    revoked: RefCell<Vec<String>>,
+}
+impl TokenIssuer for McpIssuer {
+    fn issue(&self, _: &Path) -> Result<String> {
+        panic!("the helper token already exists")
+    }
+    fn issue_mcp(&self, _: &Path) -> Result<McpSessionToken> {
+        self.issued.set(self.issued.get() + 1);
+        Ok(McpSessionToken::new(
+            format!("setup-session-{}", self.issued.get()),
+            "fake-mcp-bearer",
+        ))
+    }
+    fn revoke(&self, _: &Path, session_id: &str) -> Result<()> {
+        self.revoked.borrow_mut().push(session_id.into());
+        Ok(())
     }
 }
 
@@ -110,6 +136,12 @@ fn setup_creates_pins_both_decks_and_is_idempotent_without_starting_turns() {
     let saved_threads = threads.clone();
     let server = MockServer::new(move |request| {
         let mut projects = saved.lock().unwrap();
+        let bearer = if request.path == "/mcp" {
+            "authorization: bearer fake-mcp-bearer"
+        } else {
+            "authorization: bearer fake-test-bearer"
+        };
+        assert!(request.headers.to_ascii_lowercase().contains(bearer));
         match request.path.as_str() {
             "/api/projects" => (200, json!({"projects": *projects}).to_string()),
             "/api/projects/mutate" => match request.body["type"].as_str().unwrap() {
@@ -161,7 +193,8 @@ fn setup_creates_pins_both_decks_and_is_idempotent_without_starting_turns() {
         workspace_root: temp.path().join("workspace"),
         idle_theme: ThemeDocument::glowtube("body{}".into()).unwrap(),
     };
-    let first = setup_decks(&config, &Permissions::default()).unwrap();
+    let mcp = McpIssuer::default();
+    let first = setup_decks_with(&config, &Permissions::default(), &mcp).unwrap();
     assert_ne!(first.deck_a.id, first.deck_b.id);
     assert_eq!(first.deck_a.title, "GlowTube");
     assert_eq!(first.deck_b.title, "GlowTube B");
@@ -172,7 +205,13 @@ fn setup_creates_pins_both_decks_and_is_idempotent_without_starting_turns() {
     assert!(!first.idle_threads_required);
     assert_eq!(first.idle_thread_ids.as_ref().unwrap().len(), 2);
     assert!(paths.themes_dir.join("glowtube.json").is_file());
-    let second = setup_decks(&config, &Permissions::default()).unwrap();
+    let second = setup_decks_with(&config, &Permissions::default(), &mcp).unwrap();
+    // One short-lived MCP session per setup, each revoked afterwards.
+    assert_eq!(mcp.issued.get(), 2);
+    assert_eq!(
+        *mcp.revoked.borrow(),
+        ["setup-session-1", "setup-session-2"]
+    );
     assert_eq!(first.deck_a.id, second.deck_a.id);
     assert_eq!(first.deck_b.id, second.deck_b.id);
     let requests = server.requests.lock().unwrap();
@@ -209,8 +248,6 @@ fn installed_cli_adapter_passes_only_the_required_scopes() {
             "90d",
             "--label",
             "GlowTube helper",
-            "--subject",
-            "mcp-client",
             "--json",
         ]
         .into_iter()
@@ -218,7 +255,7 @@ fn installed_cli_adapter_passes_only_the_required_scopes() {
         .collect();
         format!("@echo off\r\n{checks}echo {{\"token\":\"fake-command-token\"}}\r\n")
     } else {
-        "#!/bin/sh\n[ \"$*\" = 'auth session issue --scope orchestration:read --scope orchestration:operate --ttl 90d --label GlowTube helper --subject mcp-client --json' ] || exit 9\nprintf '%s' '{\"token\":\"fake-command-token\"}'\n".into()
+        "#!/bin/sh\n[ \"$*\" = 'auth session issue --scope orchestration:read --scope orchestration:operate --ttl 90d --label GlowTube helper --json' ] || exit 9\nprintf '%s' '{\"token\":\"fake-command-token\"}'\n".into()
     };
     std::fs::write(&cli, script).unwrap();
     #[cfg(unix)]
@@ -227,4 +264,48 @@ fn installed_cli_adapter_passes_only_the_required_scopes() {
         std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
     assert_eq!(CliTokenIssuer.issue(&cli).unwrap(), "fake-command-token");
+}
+
+#[test]
+fn setup_without_an_mcp_session_still_sets_up_projects_and_reports_threads() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = paths(temp.path());
+    fake_token(&paths);
+    let projects = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let saved = projects.clone();
+    let server = MockServer::new(move |request| {
+        let mut projects = saved.lock().unwrap();
+        match request.path.as_str() {
+            "/api/projects" => (200, json!({"projects": *projects}).to_string()),
+            "/api/projects/mutate" => {
+                let project = json!({"id": request.body["projectId"], "title": request.body["title"],
+                    "workspaceRoot": request.body["workspaceRoot"], "pinnedAt": "today"});
+                if request.body["type"] == "project.create" {
+                    projects.push(project.clone());
+                }
+                (200, project.to_string())
+            }
+            _ => panic!("no MCP call without a setup session"),
+        }
+    });
+    runtime(&paths, &server.origin);
+    let config = SetupConfig {
+        paths: paths.clone(),
+        workspace_root: temp.path().join("workspace"),
+        idle_theme: ThemeDocument::glowtube("body{}".into()).unwrap(),
+    };
+    // The default issue_mcp reports no MCP support.
+    let report = setup_decks_with(&config, &Permissions::default(), &Issuer::default()).unwrap();
+    assert!(report.idle_threads_required);
+    assert!(report.idle_thread_ids.is_none());
+}
+
+#[test]
+fn session_ids_are_plain_before_reaching_the_command_line() {
+    use dt_t3::setup::valid_session_id;
+    assert!(valid_session_id("01HZX9-session_id"));
+    assert!(!valid_session_id(""));
+    assert!(!valid_session_id("--json"));
+    assert!(!valid_session_id("id with space"));
+    assert!(!valid_session_id("id;rm"));
 }
