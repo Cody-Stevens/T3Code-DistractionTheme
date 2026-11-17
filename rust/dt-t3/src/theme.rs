@@ -33,7 +33,7 @@ impl ThemeDocument {
     pub fn glowtube(css: String) -> Result<Self> {
         let document = Self {
             version: 1,
-            name: "GlowTube".into(),
+            name: dt_core::constants::DISPLAY_NAME.into(),
             appearance: "dark".into(),
             canvas: "#07060b".into(),
             accent: "#ff2bd6".into(),

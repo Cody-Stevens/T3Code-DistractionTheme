@@ -252,6 +252,8 @@ struct DeckState {
     clip: Option<ReadyClip>,
     published_at: Option<Instant>,
     blank: bool,
+    /// Expected picture lag behind the music for this clip, in seconds (publish lateness).
+    lag: f64,
 }
 
 /// Python's clip planning and quiet-window state, with all effects delegated to the binary.
@@ -298,6 +300,13 @@ impl FaviconScheduler {
     pub fn front_clip(&self) -> Option<&ReadyClip> {
         self.front
             .and_then(|deck| self.decks[deck.index()].clip.as_ref())
+    }
+
+    /// Expected lag of the front clip's picture behind the music, in seconds (0 with none).
+    pub fn front_lag(&self) -> f64 {
+        self.front
+            .filter(|_| self.front_clip().is_some())
+            .map_or(0.0, |deck| self.decks[deck.index()].lag)
     }
 
     /// Advance the adaptive plan without performing I/O. First clips are gated, 10-second fast
@@ -425,9 +434,20 @@ impl FaviconScheduler {
                     {
                         let clip = self.publishing.take().expect("matched publication");
                         let deck = clip.job.deck;
+                        // A clip shows `show_latency` after it is published and starts at its own
+                        // first frame, so publishing late (a slow encode) leaves its picture behind
+                        // the music for the whole clip. A gated clip has the music wait for it.
+                        let media_at_publish = now
+                            - input
+                                .wall_time
+                                .saturating_duration_since(published_at)
+                                .as_secs_f64();
+                        let mut lag = media_at_publish + self.config.show_latency.as_secs_f64()
+                            - clip.job.start.as_secs_f64();
                         if let Some(gate) = &mut self.gate
                             && gate.release_at.is_none()
                         {
+                            lag = 0.0;
                             let at = (published_at
                                 + self
                                     .config
@@ -442,6 +462,7 @@ impl FaviconScheduler {
                             clip: Some(clip),
                             published_at: Some(published_at),
                             blank: false,
+                            lag: if lag.is_finite() { lag } else { 0.0 },
                         };
                         self.allow(&mut actions);
                         if self.front.is_none() || !self.dual() {

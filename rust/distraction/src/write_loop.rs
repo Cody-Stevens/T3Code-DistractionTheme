@@ -30,6 +30,31 @@ impl WallClock for SystemWallClock {
 
 /// Frames between covered writes; twelve spare frames extend their glow/values to 2.5 seconds.
 pub const COVERED_STEP: u64 = 48;
+/// Extra lead for the glow while a favicon clip covers the player, in seconds. Measured on a
+/// screen recording: covered writes reached the screen ~0.3 s later than `display_offset` allows,
+/// while an on-time clip's picture was ~0.1 s behind the music. `GLOWTUBE_GLOW_LEAD` overrides it.
+pub const COVERED_GLOW_LEAD: f64 = 0.2;
+
+fn covered_glow_lead() -> f64 {
+    static LEAD: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *LEAD.get_or_init(|| {
+        std::env::var("GLOWTUBE_GLOW_LEAD")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .unwrap_or(COVERED_GLOW_LEAD)
+    })
+}
+
+/// Write-to-display offset: under a favicon clip the glow follows the clip's picture, which can
+/// run behind the music by the clip's publish lateness.
+pub fn glow_offset(player: &Player) -> f64 {
+    if player.favicon_live {
+        player.offset + covered_glow_lead() - player.favicon_lag.clamp(-0.5, 1.5)
+    } else {
+        player.offset
+    }
+}
 /// Python's build estimate, signed display offset, next_k and quiet hold.
 #[derive(Clone, Debug)]
 pub struct WriteTiming {
@@ -299,7 +324,7 @@ impl WriteLoop {
             self.ahead.clear();
         }
         self.playing = moving;
-        self.timing.display_offset = player.offset;
+        self.timing.display_offset = glow_offset(player);
         Ok(())
     }
     /// Synchronize discontinuities before ticking the favicon scheduler.

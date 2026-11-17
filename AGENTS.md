@@ -119,6 +119,15 @@ most of them are not documented by T3 Code.
   rather than waited for. Measured: 100% coverage while music plays across start, seeks,
   pause/resume and the track looping; audio/video offset median 0.08 s, 95% within 0.25 s
   (`tools/sync_full.py`, which matches the screen against the whole source video).
+- **The glow follows the clip on screen, not the music.** A clip plays from its first frame when it
+  shows, so a clip published late (its encode finished late) stays that far behind the music for
+  its whole length. Measured on a screen recording against the source video: 0-0.6 s per clip, and
+  the worst was the third clip after a seek. The scheduler records each clip's publish lateness
+  (`front_lag`), and while a clip covers the player the glow's write offset is
+  `offset + COVERED_GLOW_LEAD - lag`. `COVERED_GLOW_LEAD` (0.2 s, `GLOWTUBE_GLOW_LEAD` overrides
+  it) covers covered writes landing ~0.3 s later than `display_offset` allows. Glow vs picture at
+  scene cuts went from a median of +184 ms (50% within 200 ms) to +17 ms (73% within 200 ms).
+  The picture's own lag behind the music is unchanged.
 - The long quiet write is built cheaply (a still video frame under a clip, ~0.25 s); request it
   ~1.75 s before a clip starts. Frame durations alternate 41/42 ms to average exactly 24 fps.
 - Each favicon only renders inside a sidebar thread row, so each deck project needs one idle thread.

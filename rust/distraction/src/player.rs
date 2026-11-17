@@ -118,6 +118,8 @@ pub struct Player {
     pub favicon_live: bool,
     /// Front deck, supplied by the favicon adapter.
     pub favicon_front: Option<char>,
+    /// Expected lag of the front favicon clip behind the music, in seconds.
+    pub favicon_lag: f64,
     /// Basenames allowed to show; None leaves filtering unchanged, empty hides every clip.
     pub favicon_allow: Option<Vec<String>>,
     /// Manual wall-time hold from ctl holdwrites.
@@ -184,6 +186,7 @@ impl Player {
             favicon_enabled: true,
             favicon_live: false,
             favicon_front: None,
+            favicon_lag: 0.0,
             favicon_allow: None,
             hold_until: None,
             revision: 0,

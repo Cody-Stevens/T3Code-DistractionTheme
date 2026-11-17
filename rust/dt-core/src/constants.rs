@@ -81,7 +81,7 @@ pub const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 /// Theme file stem and selected theme ID.
 pub const THEME_ID: &str = "glowtube";
 /// T3 project title and theme display name.
-pub const DISPLAY_NAME: &str = "GlowTube";
+pub const DISPLAY_NAME: &str = "Distraction";
 /// Card width in CSS pixels.
 pub const CARD_WIDTH: u32 = 276;
 /// Card raster scale relative to CSS pixels.
