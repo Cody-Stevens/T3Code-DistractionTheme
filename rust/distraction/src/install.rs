@@ -140,11 +140,16 @@ fn copy_unless_same(from: &Path, to: &Path) -> Result<()> {
 }
 
 /// Start the service outside the caller's console and job, so closing the terminal that ran
-/// `install` doesn't stop it.
+/// `install` doesn't stop it. It runs from its own folder: inheriting the caller's working
+/// directory would keep that folder (often a checkout) in use for as long as the service runs.
 fn start_detached(service: &Path) -> Result<()> {
+    let dir = service
+        .parent()
+        .ok_or(Error::InvalidInput("service has no folder"))?;
     let spawn = |flags: u32| {
         let mut command = Command::new(service);
         command
+            .current_dir(dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
