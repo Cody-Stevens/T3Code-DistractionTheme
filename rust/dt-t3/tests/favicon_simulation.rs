@@ -389,6 +389,31 @@ fn start_and_steady_playback_cover_every_audible_interval() {
 }
 
 #[test]
+fn seek_cancels_an_unacknowledged_quiet_request_before_replanning() {
+    let track = track(241);
+    let mut sim = Simulation::new();
+    sim.grant_quiet = false;
+    while sim.requests.is_empty() {
+        assert!(sim.wall < 5.0);
+        sim.step(Some(&track));
+        sim.advance();
+    }
+    assert!(sim.publishes.is_empty());
+    // The write owner rejects the old request on a seek and cannot acknowledge it.
+    sim.seek(40.0);
+    sim.grant_quiet = true;
+    sim.grant = None;
+    sim.grant_due = None;
+    sim.step(Some(&track));
+    sim.run_until(&track, 50.0);
+    assert!(sim.requests.len() >= 2);
+    assert_eq!(sim.publishes[0].media, 40.0);
+    assert_eq!(sim.holds, 2);
+    assert_eq!(sim.blanks, 0);
+    sim.assert_covered();
+}
+
+#[test]
 fn in_range_seek_and_track_change_restart_without_blank_publications() {
     let track = track(400);
     let mut sim = Simulation::new();

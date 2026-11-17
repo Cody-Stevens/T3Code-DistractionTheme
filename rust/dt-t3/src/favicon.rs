@@ -592,6 +592,9 @@ impl FaviconScheduler {
 
     fn drop_plan(&mut self, actions: &mut Vec<FaviconAction>) {
         if !self.plan.is_empty() || self.publishing.is_some() {
+            // CancelPending invalidates the binary's revision-tagged quiet request too.
+            // Waiting for its obsolete acknowledgement would strand every replacement plan.
+            self.quiet_requested_at = None;
             let busy = self.plan.iter().any(|p| p.running);
             self.plan.clear();
             self.publishing = None;
@@ -627,6 +630,7 @@ impl FaviconScheduler {
     }
 
     fn restart(&mut self, actions: &mut Vec<FaviconAction>) {
+        self.latest_grant = None;
         self.release_audio(actions);
         self.set_front(None, actions);
         self.drop_plan(actions);
