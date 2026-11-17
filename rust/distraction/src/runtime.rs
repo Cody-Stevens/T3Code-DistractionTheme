@@ -142,8 +142,7 @@ fn favicon(paths: T3Paths) -> Result<FaviconDriver> {
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
         .and_then(|s| Duration::try_from_secs_f64(s).ok())
-        // Native AVIF load timing differs from Pillow; retain the explicit tuning override.
-        .unwrap_or(Duration::from_millis(400));
+        .unwrap_or(Duration::from_millis(500));
     let config = dt_t3::favicon::FaviconConfig {
         clips_dir: clips_dir.clone(),
         project_id: project.id.clone(),

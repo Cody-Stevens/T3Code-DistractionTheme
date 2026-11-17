@@ -60,7 +60,7 @@ API completions carry their actual monotonic completion time, so delayed event c
 shift the gate or deck-flip deadlines. The newest deck remains the planning base, each handover
 retains three seconds of overlap, and terminal clips hold through the fractional PCM tail until EOF.
 
-Native playback defaults to 0.4 seconds of show latency and a 0.3-second first-clip gate, measured
+Native playback uses Python's 0.5-second show latency and a 0.3-second first-clip gate, measured
 with its AVIF output; Python uses 0.5 seconds for both. `GLOWTUBE_FAVICON_LATENCY` and
 `GLOWTUBE_FIRST_LATENCY` override these values. Set `GLOWTUBE_DEBUG=1` to log Unix wall
 timestamps, jumps, clip plans/start/end/deadlines, encoder duration, quiet request/grant, API
@@ -181,7 +181,7 @@ Setup uses `setup_decks` and reports when idle sidebar threads could not be prov
   Port, volume, gate, first/max clip lengths, show latency and measure/loading switches are wired.
 - Service lifecycle logs omit Python's timestamp/PID/exit-code detail. Player timing events are
   available through `GLOWTUBE_DEBUG`; Python's periodic ahead-counter summary is not implemented.
-- The native show/gate latency defaults are 0.4/0.3 seconds rather than Python's 0.5 seconds. The scheduler
+- The native first-clip gate is 0.3 seconds rather than Python's 0.5 seconds. The scheduler
   uses actual API completion timestamps and keeps the terminal picture through the fractional
   PCM tail, avoiding a hold for an unencodable sub-second clip.
 - HTTP input and errors are bounded/redacted. Invalid numeric arguments return 400 rather than
