@@ -122,11 +122,33 @@ most of them are not documented by T3 Code.
 - The long quiet write is built cheaply (a still video frame under a clip, ~0.25 s); request it
   ~1.75 s before a clip starts. Frame durations alternate 41/42 ms to average exactly 24 fps.
 - Each favicon only renders inside a sidebar thread row, so each deck project needs one idle thread.
-  Setup does not create these yet (`t3 thread start` always sends an agent message); creating an
-  idle thread through the API is open work.
+  `t3 thread start` always sends an agent message, so the Rust setup creates them through T3's HTTP
+  MCP endpoint (`/mcp`, tool `t3_thread_launch` with no message), which starts no turn. That
+  endpoint only accepts sessions issued with `--subject mcp-client`, and T3 refuses those sessions
+  everywhere else, including the HTTP API the player uses. So the helper's long-lived token is a
+  generic session, and setup issues a separate 15-minute `mcp-client` session (same two scopes),
+  keeps it in memory, uses it for the two idle threads and revokes it at once. If that session
+  can't be issued, setup still does the rest and reports that the threads must be made by hand.
 - Measure coverage with `GLOWTUBE_MEASURE=1` (the theme paints the player magenta under the clips)
   and `tools/overlay_chart.py`.
 - Every client signed in to the T3 server downloads the clips (the favicon is server state).
+
+## Install and the service (Rust)
+
+- `distraction install` runs setup (token, both deck projects rooted in
+  `%LOCALAPPDATA%\GlowTube\workspace`, idle threads, theme file, theme selection), copies
+  `distraction.exe` and the windowless `distraction-service.exe` to `%LOCALAPPDATA%\GlowTube\bin`,
+  and registers the service in `HKCU\...\CurrentVersion\Run` as `GlowTube`.
+- The service runs the player only while T3's server is alive **and** `settings.json` selects the
+  `glowtube` theme. Picking another theme is the off switch. Because setup selects the theme, the
+  service must not run setup while another theme is selected, or it would undo the user's choice
+  on every T3 start.
+- The player lives in a kill-on-close job owned by the service, so killing the service kills the
+  player without blanking the favicons or writing the idle theme. Stop it with the stop-request
+  file (`%LOCALAPPDATA%\GlowTube\service.stop`, which `distraction uninstall` writes); the service
+  then quits the player through its control port and exits.
+- The Rust service's mutex (`Local\GlowTubeDistractionService`) differs from the Python service's,
+  so the two don't exclude each other. Run only one helper (both use port 47873).
 
 ## Rules
 

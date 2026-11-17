@@ -54,6 +54,11 @@ impl T3Api {
     /// local API traffic and validate the runtime origin before sending the bearer.
     pub fn new(paths: T3Paths) -> Result<Self> {
         let token = std::fs::read_to_string(&paths.token_file)?;
+        Self::with_token(paths, &token)
+    }
+
+    /// A client using `token` instead of the token file: setup's short-lived MCP session.
+    pub fn with_token(paths: T3Paths, token: &str) -> Result<Self> {
         let token = token.trim();
         if token.is_empty() {
             return Err(Error::InvalidInput("empty T3 token"));
@@ -222,8 +227,9 @@ impl T3Api {
 
     /// Ensure an unsettled, unsnoozed idle sidebar thread through T3's HTTP MCP transport.
     /// Source-verified: t3_thread_launch omits message/attachments, so no turn is dispatched.
-    /// Requires subject=mcp-client (with only the existing orchestration scopes), not a provider
-    /// session. Older generic bearer tokens remain valid for the projects API but receive 401 here.
+    /// Requires a subject=mcp-client session (with only the orchestration scopes). T3 accepts those
+    /// only on /mcp, so setup issues a short-lived one for this call (see `setup::setup_decks_with`);
+    /// the helper's generic token gets 401 here and keeps working for the projects API.
     pub fn ensure_idle_thread(&self, project_id: &str) -> Result<String> {
         let mut session = McpSession::connect(self)?;
         let listed = session.tool(

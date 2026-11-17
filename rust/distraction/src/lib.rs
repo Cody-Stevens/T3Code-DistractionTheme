@@ -7,6 +7,7 @@ pub mod diagnostics;
 pub mod encoder_process;
 pub mod favicon;
 pub mod favicon_thread;
+pub mod install;
 pub mod player;
 pub mod runtime;
 pub mod supervisor;
@@ -32,6 +33,8 @@ pub fn run(cli: cli::Cli) -> Result<()> {
         cli::Command::Setup => runtime::setup_with_paths(dt_t3::T3Paths::discover()?),
         cli::Command::Service => supervisor::serve(),
         cli::Command::Idle => runtime::idle(),
+        cli::Command::Install => install::install(),
+        cli::Command::Uninstall => install::uninstall(),
         cli::Command::InternalEncodeFavicon => encoder_process::serve(),
     }
 }

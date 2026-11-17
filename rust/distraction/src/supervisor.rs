@@ -24,6 +24,27 @@ pub fn t3_running(paths: &T3Paths) -> bool {
     runtime_running(&paths.runtime_file, dt_platform::process::pid_alive)
 }
 
+/// True when T3's settings select the GlowTube theme. Picking another theme in T3 is how the user
+/// turns the helper off, so the service runs the player only while this holds (and setup, which
+/// selects the theme, therefore never overrides that choice). Unreadable settings count as false.
+pub fn theme_selected(settings: &Path) -> bool {
+    fs::read(settings)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|value| {
+            value
+                .get("defaultTheme")
+                .and_then(|theme| theme.as_str())
+                .map(|theme| theme == crate::install::THEME_ID)
+        })
+        .unwrap_or(false)
+}
+
+/// The stop-request file `distraction uninstall`/`install` create to stop the service cleanly.
+pub fn stop_file(state: &Path) -> PathBuf {
+    state.join(crate::install::STOP_FILE)
+}
+
 /// Spawn this executable with play, hidden, append-only logs, without a shell.
 pub fn start_player(executable: &Path, state_dir: &Path) -> Result<Child> {
     fs::create_dir_all(state_dir)?;
@@ -151,7 +172,8 @@ impl<H: SupervisorHost> Supervisor<H> {
     pub fn tick(&mut self, now: Duration) -> Result<()> {
         let running = self.host.running();
         if self.child && !running {
-            self.host.log("T3 closed; stopping the player");
+            self.host
+                .log("T3 closed or another theme selected; stopping the player");
             self.host.stop()?;
             self.child = false;
             self.crashes = 0;
@@ -207,7 +229,7 @@ struct NativeHost {
 }
 impl SupervisorHost for NativeHost {
     fn running(&mut self) -> bool {
-        t3_running(&self.paths)
+        t3_running(&self.paths) && theme_selected(&self.paths.settings_file)
     }
     fn setup(&mut self) -> Result<()> {
         crate::runtime::setup_with_paths(self.paths.clone())
@@ -255,25 +277,46 @@ impl SupervisorHost for NativeHost {
 }
 /// Hold one service mutex, poll every 3 s, and stop the owned player on shutdown/T3 exit.
 pub fn serve() -> Result<()> {
+    serve_with(std::env::current_exe()?)
+}
+
+/// [`serve`], starting `player` (a `distraction.exe`) for playback. The windowless
+/// `distraction-service.exe` passes its sibling `distraction.exe`.
+pub fn serve_with(player: PathBuf) -> Result<()> {
     let Some(_instance) =
         dt_platform::process::single_instance(dt_platform::process::SERVICE_MUTEX)?
     else {
         return Ok(());
     };
-    let shutdown = crate::runtime::termination_flag()?;
+    // Without a console (the windowless service) there may be no Ctrl-C to catch; the stop file
+    // still ends the loop cleanly.
+    let shutdown = crate::runtime::termination_flag()
+        .unwrap_or_else(|_| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    let state = crate::runtime::state_dir()?;
+    let stop = stop_file(&state);
+    let _ = fs::remove_file(&stop); // a request left from an earlier run is not for this one
     let host = NativeHost {
         paths: T3Paths::discover()?,
-        executable: std::env::current_exe()?,
-        state: crate::runtime::state_dir()?,
+        executable: player,
+        state,
         child: None,
         port: crate::runtime::control_port()?,
     };
     let mut supervisor = Supervisor::new(host);
+    supervisor.host.log("service started");
     let start = Instant::now();
     while !shutdown.load(std::sync::atomic::Ordering::Acquire) {
+        if stop.exists() {
+            let _ = fs::remove_file(&stop);
+            supervisor.host.log("stop requested");
+            break;
+        }
         supervisor.tick(start.elapsed())?;
         let deadline = Instant::now() + SERVICE_POLL;
-        while Instant::now() < deadline && !shutdown.load(std::sync::atomic::Ordering::Acquire) {
+        while Instant::now() < deadline
+            && !shutdown.load(std::sync::atomic::Ordering::Acquire)
+            && !stop.exists()
+        {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
