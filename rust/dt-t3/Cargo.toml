@@ -14,6 +14,10 @@ serde.workspace = true
 serde_json.workspace = true
 # Random project/command IDs match t3api.py without platform process-global counters.
 uuid = { version = "1.18", features = ["v4"] }
+# Same-directory temporary files provide atomic replacement on Windows and Unix, with RAII cleanup.
+tempfile = "3.23"
+# UTC settings timestamps without a platform-specific date command.
+time = { version = "=0.3.44", features = ["formatting"] }
 
 [lints]
 workspace = true
