@@ -13,6 +13,12 @@ cpal = { version = "0.16", default-features = false }
 rustfft = "6.4"
 # Parse yt-dlp/ffprobe JSON; tools run through std::process without a shell.
 serde_json.workspace = true
+# Preallocated single-producer/single-consumer commands keep locks and allocation out of callbacks.
+rtrb = "0.3.2"
+
+[dev-dependencies]
+# Private scratch media and mock-tool directories are removed after tests and measurements.
+tempfile = "3.23"
 
 [lints]
 workspace = true
