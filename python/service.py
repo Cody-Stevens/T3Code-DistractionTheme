@@ -10,7 +10,8 @@ crashes. Setup makes everything a fresh install needs, skipping what already exi
 
   1. a T3 access token for the player, scoped to orchestration:read and orchestration:operate,
      stored in ~\\.secrets\\t3code-distraction-theme\\t3-token, readable only by this user;
-  2. the "GlowTube" project, rooted at this folder and pinned, whose favicon carries the video;
+  2. the "GlowTube" project, rooted at this folder, and "GlowTube B", rooted at deck-b, both pinned;
+     their favicons carry the video (two, so each clip loads behind the other before it shows);
   3. the GlowTube theme file, selected as T3's theme.
 
 Logs go to %LOCALAPPDATA%\\GlowTube\\service.log and player.log.
@@ -92,11 +93,12 @@ def ensure_token() -> None:
     log("issued the T3 token")
 
 
-def ensure_project(api: t3api.T3Api) -> dict:
-    project = api.find_project("GlowTube", str(HERE))
+def ensure_project(api: t3api.T3Api, title: str, root: Path) -> dict:
+    root.mkdir(exist_ok=True)
+    project = api.find_project(title, str(root))
     if project is None:
-        project = api.create_project("GlowTube", str(HERE))
-        log(f"created the GlowTube project {project['id']}")
+        project = api.create_project(title, str(root))
+        log(f"created the {title} project {project['id']}")
     if not project.get("pinnedAt"):
         api.update_project(project["id"], pinned=True)
     return project
@@ -123,7 +125,8 @@ def ensure_theme() -> None:
 def setup() -> None:
     ensure_token()
     api = t3api.T3Api()
-    ensure_project(api)
+    ensure_project(api, "GlowTube", HERE)
+    ensure_project(api, "GlowTube B", HERE / "deck-b")
     ensure_theme()
 
 
