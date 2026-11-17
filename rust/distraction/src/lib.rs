@@ -3,8 +3,10 @@
 pub mod ahead_pool;
 pub mod cli;
 pub mod control;
+pub mod diagnostics;
 pub mod encoder_process;
 pub mod favicon;
+pub mod favicon_thread;
 pub mod player;
 pub mod runtime;
 pub mod supervisor;

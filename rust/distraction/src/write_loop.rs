@@ -596,10 +596,19 @@ impl WriteLoop {
             }
             self.last_write = Some(self.wall.now());
             self.last_css = Some(built.css);
+            crate::diagnostics::log(format_args!(
+                "write audio={:.3} build={measured:.3} quiet={quiet_batch} front={:?}",
+                self.clock.media_time().as_secs_f64(),
+                player.favicon_front
+            ));
         }
         // A tagged held-still batch can grant an already quiet theme without rewriting it.
         if quiet_batch && self.quiet_requested {
             let granted = self.wall.now();
+            crate::diagnostics::log(format_args!(
+                "quiet grant audio={:.3} build={measured:.3} changed={changed}",
+                self.clock.media_time().as_secs_f64()
+            ));
             self.quiet_requested = false;
             self.batch_quiet = false;
             self.timing.next_frame = None;

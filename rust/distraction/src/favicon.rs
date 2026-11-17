@@ -13,7 +13,7 @@ use std::{
 };
 
 /// Injectable scheduler boundary, including fake late quiet requests.
-pub trait Scheduler {
+pub trait Scheduler: Send {
     /// Advance from a snapshot and completed effects.
     fn tick(&mut self, input: FaviconTick<'_>) -> Result<Vec<FaviconAction>>;
     /// Request final cancellation/blanking.
@@ -29,6 +29,10 @@ impl Scheduler for FaviconScheduler {
 }
 /// Blocking favicon effects; only encode/API worker threads call these during playback.
 pub trait FaviconEffects: Send + Sync {
+    /// Timestamp completed publications in the same monotonic domain as scheduler ticks.
+    fn wall_time(&self) -> Instant {
+        Instant::now()
+    }
     /// Warm an isolated encoder; called only on its worker thread.
     fn warm_encoder(&self, _epoch: &EncodeEpoch) -> Result<()> {
         Ok(())
@@ -71,7 +75,7 @@ enum EncodeJob {
     Clip(u64, ClipJob),
 }
 enum ApiJob {
-    Publish(String, PathBuf, Instant),
+    Publish(String, PathBuf, Instant, Arc<dyn dt_core::Clock>),
     Blank(String, PathBuf),
     Cleanup(PathBuf, usize),
 }
@@ -89,6 +93,7 @@ pub struct FaviconDriver {
     generation: Arc<AtomicU64>,
     deferred: Vec<FaviconEvent>,
     stopped: bool,
+    observed: Option<(u64, String)>,
 }
 impl FaviconDriver {
     /// Construct with native or fake scheduler/effects; starts no media until asked by tick.
@@ -109,14 +114,28 @@ impl FaviconDriver {
                 return (generation, None);
             }
             let event = match job {
-                ApiJob::Publish(project_id, path, deadline) => Some(
-                    if Instant::now() < deadline && api_effects.publish(&project_id, &path).is_ok()
-                    {
-                        FaviconEvent::Published(path)
+                ApiJob::Publish(project_id, path, deadline, clock) => Some({
+                    crate::diagnostics::log(format_args!(
+                        "publish begin file={} audio={:.3}",
+                        path.file_name().unwrap_or_default().to_string_lossy(),
+                        clock.media_time().as_secs_f64()
+                    ));
+                    let success = Instant::now() < deadline
+                        && api_effects.publish(&project_id, &path).is_ok();
+                    crate::diagnostics::log(format_args!(
+                        "publish end file={} audio={:.3} success={success}",
+                        path.file_name().unwrap_or_default().to_string_lossy(),
+                        clock.media_time().as_secs_f64()
+                    ));
+                    if success {
+                        FaviconEvent::PublishedAt {
+                            path,
+                            wall_time: api_effects.wall_time(),
+                        }
                     } else {
                         FaviconEvent::PublishFailed(path)
-                    },
-                ),
+                    }
+                }),
                 ApiJob::Blank(project_id, path) => {
                     let _ = api_effects.blank(&project_id, &path);
                     None
@@ -139,6 +158,7 @@ impl FaviconDriver {
             generation,
             deferred: vec![],
             stopped: false,
+            observed: None,
         })
     }
     fn encoder(
@@ -173,8 +193,27 @@ impl FaviconDriver {
                 }
                 let _ = starts.send((expected, Some(FaviconEvent::EncodeStarted(job.clone()))));
             }
+            let began = Instant::now();
+            crate::diagnostics::log(format_args!(
+                "encode begin deck={} track={} start={:.3} end={:.3} length={:.3}",
+                job.deck.name(),
+                job.track_id,
+                job.start.as_secs_f64(),
+                (job.start + job.duration).as_secs_f64(),
+                job.duration.as_secs_f64()
+            ));
             let event = match effects.encode(job.clone(), &epoch) {
-                Ok(clip) => FaviconEvent::Encoded(clip),
+                Ok(clip) => {
+                    crate::diagnostics::log(format_args!(
+                        "encode end deck={} start={:.3} end={:.3} frames={} elapsed={:.3}",
+                        job.deck.name(),
+                        job.start.as_secs_f64(),
+                        clip.end().as_secs_f64(),
+                        clip.frames,
+                        began.elapsed().as_secs_f64()
+                    ));
+                    FaviconEvent::Encoded(clip)
+                }
                 Err(_) => FaviconEvent::EncodeFailed(job),
             };
             (expected, Some(event))
@@ -182,13 +221,42 @@ impl FaviconDriver {
         worker.submit(EncodeJob::Warm(expected))?;
         Ok(worker)
     }
-    /// About 100 ms per tick; HTTP/encode work never blocks the write owner.
+    /// Advance one snapshot; HTTP/encode work never blocks the caller.
     pub fn tick(
         &mut self,
         player: &mut Player,
         writes: &mut WriteLoop,
         now: Instant,
     ) -> Result<()> {
+        self.tick_host(
+            &mut crate::favicon_thread::OwnerHost { player, writes },
+            now,
+        )
+    }
+    pub(crate) fn tick_host(
+        &mut self,
+        host: &mut impl crate::favicon_thread::Host,
+        now: Instant,
+    ) -> Result<()> {
+        let input = host.input();
+        let observed = (
+            input.jumps,
+            input
+                .track
+                .as_ref()
+                .map(|t| t.id.clone())
+                .unwrap_or_default(),
+        );
+        if self.observed.as_ref() != Some(&observed) {
+            crate::diagnostics::log(format_args!(
+                "restart jump={} track={} audio={:.3} latency={:.3}",
+                observed.0,
+                observed.1,
+                host.clock().media_time().as_secs_f64(),
+                input.output_latency.as_secs_f64()
+            ));
+            self.observed = Some(observed);
+        }
         // A worker cannot cross from queued to running between the snapshot and cancellation.
         let start = self
             .start_barrier
@@ -209,14 +277,14 @@ impl FaviconDriver {
             }
         }
         let actions = self.scheduler.tick(FaviconTick {
-            track: player.ready().map(|t| &t.info),
-            media_time: player.clock().media_time(),
-            jumps: player.jumps,
+            track: input.track.as_ref(),
+            media_time: host.clock().media_time(),
+            jumps: input.jumps,
             wall_time: now,
-            playing: player.playing,
-            enabled: player.favicon_enabled,
-            output_latency: player.output_latency,
-            quiet_granted_at: writes.quiet_written_at(),
+            playing: input.playing,
+            enabled: input.enabled,
+            output_latency: input.output_latency,
+            quiet_granted_at: host.quiet_landed(),
             events,
         })?;
         if actions
@@ -231,6 +299,16 @@ impl FaviconDriver {
             let generation = self.generation.load(Ordering::Acquire);
             match action {
                 FaviconAction::Encode(job) => {
+                    crate::diagnostics::log(format_args!(
+                        "plan deck={} track={} start={:.3} end={:.3} done_by={:.3} length={:.3} speed={}",
+                        job.deck.name(),
+                        job.track_id,
+                        job.start.as_secs_f64(),
+                        (job.start + job.duration).as_secs_f64(),
+                        job.done_by.as_secs_f64(),
+                        job.duration.as_secs_f64(),
+                        job.speed
+                    ));
                     if self
                         .encode
                         .submit(EncodeJob::Clip(generation, job.clone()))
@@ -239,7 +317,10 @@ impl FaviconDriver {
                         self.deferred.push(FaviconEvent::EncodeFailed(job));
                     }
                 }
-                FaviconAction::CancelPending => (),
+                FaviconAction::CancelPending => crate::diagnostics::log(format_args!(
+                    "restart cancel pending audio={:.3}",
+                    host.clock().media_time().as_secs_f64()
+                )),
                 FaviconAction::ReplaceEncoder => {
                     self.effects.cancel_encoder()?;
                     self.encode.stop()?;
@@ -254,21 +335,41 @@ impl FaviconDriver {
                     request_id,
                     deadline,
                 } => {
-                    let media_time = player.hold_audio(deadline)?;
+                    let media_time = host.hold_audio(deadline)?;
+                    crate::diagnostics::log(format_args!(
+                        "gate hold request={request_id} audio={:.3}",
+                        media_time.as_secs_f64()
+                    ));
                     self.deferred.push(FaviconEvent::AudioHeld {
                         request_id,
                         media_time,
                     });
                 }
-                FaviconAction::ReleaseAudio { at } => player.release_audio(at)?,
-                FaviconAction::RequestQuiet => writes.request_quiet(),
+                FaviconAction::ReleaseAudio { at } => {
+                    crate::diagnostics::log(format_args!(
+                        "gate release audio={:.3} in={:.3}",
+                        host.clock().media_time().as_secs_f64(),
+                        at.map(|t| t.saturating_duration_since(Instant::now()).as_secs_f64())
+                            .unwrap_or_default()
+                    ));
+                    host.release_audio(at)?;
+                }
+                FaviconAction::RequestQuiet => {
+                    crate::diagnostics::log(format_args!(
+                        "quiet request audio={:.3}",
+                        host.clock().media_time().as_secs_f64()
+                    ));
+                    host.request_quiet();
+                }
                 FaviconAction::Publish {
                     project_id, path, ..
                 } => {
-                    let granted = writes.quiet_granted_at().is_some_and(|grant| now >= grant)
-                        && writes.timing.hold_until.is_some_and(|until| now < until)
-                        && player.playing
-                        && player.favicon_enabled;
+                    let granted = host
+                        .quiet_landed()
+                        .is_some_and(|grant| now >= grant + QUIET_SETTLE)
+                        && host.hold_until().is_some_and(|until| now < until)
+                        && input.playing
+                        && input.enabled;
                     if !granted
                         || self
                             .api
@@ -277,7 +378,8 @@ impl FaviconDriver {
                                 ApiJob::Publish(
                                     project_id,
                                     path.clone(),
-                                    writes.timing.hold_until.expect("granted hold"),
+                                    host.hold_until().expect("granted hold"),
+                                    host.clock(),
                                 ),
                             ))
                             .is_err()
@@ -294,14 +396,16 @@ impl FaviconDriver {
                     .api
                     .submit((generation, ApiJob::Cleanup(clips_dir, keep)))?,
                 FaviconAction::SetFront(front) => {
+                    crate::diagnostics::log(format_args!(
+                        "front flip deck={} audio={:.3}",
+                        front.map(Deck::name).unwrap_or("none"),
+                        host.clock().media_time().as_secs_f64()
+                    ));
                     let front = front.map(|deck| match deck {
                         Deck::A => 'a',
                         Deck::B => 'b',
                     });
-                    if player.favicon_front != front {
-                        player.favicon_front = front;
-                        player.dirty = true;
-                    }
+                    host.set_front(front);
                 }
                 FaviconAction::SetAllowedFiles(files) => {
                     let files: Vec<_> = files
@@ -311,19 +415,10 @@ impl FaviconDriver {
                     dt_render::css::favicon_allow_css(
                         &files.iter().map(String::as_str).collect::<Vec<_>>(),
                     )?;
-                    if player.favicon_allow.as_ref() != Some(&files) {
-                        player.favicon_allow = Some(files);
-                        player.dirty = true;
-                    }
+                    host.set_allowed(files);
                 }
                 FaviconAction::SetLive(live) => {
-                    if player.favicon_live != live {
-                        player.dirty = true;
-                    }
-                    player.favicon_live = live;
-                    if !live {
-                        player.favicon_front = None;
-                    }
+                    host.set_live(live);
                 }
             }
         }

@@ -60,7 +60,25 @@ impl MediaLoader for NativeLoader {
     }
 }
 #[derive(Clone)]
-struct SharedOutput(Arc<Mutex<Box<dyn AudioOutput>>>);
+pub(crate) struct SharedOutput(Arc<Mutex<Box<dyn AudioOutput>>>);
+impl SharedOutput {
+    pub(crate) fn hold(&self, deadline: Instant) -> Result<Duration> {
+        let mut audio = self
+            .0
+            .lock()
+            .map_err(|_| Error::Protocol("audio control failed"))?;
+        audio.hold()?;
+        let position = audio.media_time();
+        audio.release_at(deadline)?;
+        Ok(position)
+    }
+    pub(crate) fn release(&self, at: Option<Instant>) -> Result<()> {
+        self.0
+            .lock()
+            .map_err(|_| Error::Protocol("audio control failed"))?
+            .release_at(at.unwrap_or_else(Instant::now))
+    }
+}
 impl Clock for SharedOutput {
     fn media_time(&self) -> Duration {
         self.0
@@ -190,24 +208,22 @@ impl Player {
     pub fn clock(&self) -> Arc<dyn Clock> {
         Arc::new(self.audio.clone())
     }
+    pub(crate) fn audio_handle(&self) -> SharedOutput {
+        self.audio.clone()
+    }
     /// Query the output's actual hold/deadline state, including releases between owner ticks.
     pub fn held(&self) -> bool {
         self.output(|audio| Ok(audio.gated())).unwrap_or(false)
     }
     /// Freeze the native cursor and arm its independent failsafe before acknowledging the position.
     pub fn hold_audio(&mut self, deadline: Instant) -> Result<Duration> {
-        let position = self.output(|audio| {
-            audio.hold()?;
-            let position = audio.media_time();
-            audio.release_at(deadline)?;
-            Ok(position)
-        })?;
+        let position = self.audio.hold(deadline)?;
         self.dirty = true;
         Ok(position)
     }
     /// Replace the failsafe with the picture's deadline, or release immediately.
     pub fn release_audio(&mut self, at: Option<Instant>) -> Result<()> {
-        self.output(|audio| audio.release_at(at.unwrap_or_else(Instant::now)))?;
+        self.audio.release(at)?;
         self.dirty = true;
         Ok(())
     }

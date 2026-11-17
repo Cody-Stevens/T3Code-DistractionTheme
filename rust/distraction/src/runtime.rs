@@ -22,7 +22,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 /// Logs, media cache, clips and encoder scratch stay on the local system drive.
@@ -142,7 +142,8 @@ fn favicon(paths: T3Paths) -> Result<FaviconDriver> {
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
         .and_then(|s| Duration::try_from_secs_f64(s).ok())
-        .unwrap_or(FAVICON_SHOW_LATENCY);
+        // Native AVIF load timing differs from Pillow; retain the explicit tuning override.
+        .unwrap_or(Duration::from_millis(400));
     let config = dt_t3::favicon::FaviconConfig {
         clips_dir: clips_dir.clone(),
         project_id: project.id.clone(),
@@ -156,6 +157,7 @@ fn favicon(paths: T3Paths) -> Result<FaviconDriver> {
                 .as_nanos()
         ),
         show_latency: latency,
+        first_show_latency: Some(duration_setting("GLOWTUBE_FIRST_LATENCY", 0.3)?),
         first_clip: duration_setting("GLOWTUBE_FIRST_CLIP", 10.0)?,
         clip_seconds: duration_setting("GLOWTUBE_CLIP_SECONDS", 22.0)?,
         gate: std::env::var("GLOWTUBE_GATE").as_deref() != Ok("0"),
@@ -268,7 +270,9 @@ pub fn play(urls: Vec<String>) -> Result<()> {
     let mut player = Player::new(urls)?;
     let mut writes = WriteLoop::new(player.clock(), WriteTiming::default())?;
     let mut favicon = match favicon(T3Paths::discover()?) {
-        Ok(driver) => Some(driver),
+        Ok(driver) => Some(crate::favicon_thread::FaviconThread::start(
+            driver, &player,
+        )?),
         Err(_) => {
             eprintln!("favicon unavailable; theme video remains active");
             None
@@ -300,7 +304,6 @@ pub fn play(urls: Vec<String>) -> Result<()> {
         Ok(watcher) => watchers.push(watcher),
         Err(_) => eprintln!("media keys unavailable"),
     }
-    let mut next_favicon = Instant::now();
     let result = (|| -> Result<()> {
         while player.running && !shutdown.load(Ordering::Acquire) {
             for request in receive.try_iter().take(64) {
@@ -317,21 +320,18 @@ pub fn play(urls: Vec<String>) -> Result<()> {
             player.poll()?;
             // Synchronize source revisions before the scheduler can request a fresh quiet batch.
             writes.synchronize(&player)?;
-            if Instant::now() >= next_favicon {
-                if let Some(favicon) = favicon.as_mut()
-                    && let Err(error) = favicon.tick(&mut player, &mut writes, Instant::now())
-                {
-                    eprintln!("favicon tick failed: {error}");
-                }
-                next_favicon = Instant::now() + Duration::from_millis(100);
+            if let Some(favicon) = favicon.as_mut() {
+                favicon.synchronize(&mut player, &mut writes);
             }
             if let Err(error) = writes.tick(&mut player) {
                 eprintln!("theme write failed: {error}");
             }
+            if let Some(favicon) = favicon.as_mut() {
+                favicon.synchronize(&mut player, &mut writes);
+            }
             let wait = writes
                 .delay(&player)
-                .min(next_favicon.saturating_duration_since(Instant::now()))
-                .clamp(Duration::from_millis(1), Duration::from_millis(50));
+                .clamp(Duration::from_millis(1), Duration::from_millis(20));
             match receive.recv_timeout(wait) {
                 Ok(request) => handle_request(&mut player, request),
                 Err(mpsc::RecvTimeoutError::Timeout) => (),
@@ -347,7 +347,7 @@ pub fn play(urls: Vec<String>) -> Result<()> {
     let server_result = server.stop();
     let favicon_result = favicon
         .as_mut()
-        .map(|driver| driver.stop_for_player(&mut player))
+        .map(|driver| driver.stop())
         .unwrap_or(Ok(()));
     let player_result = player.stop();
     let write_result = writes.stop();

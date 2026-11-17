@@ -1178,6 +1178,7 @@ fn real_scheduler_holds_replaces_on_seek_allows_and_publishes_then_releases() {
     use crate::favicon::{EncodeEpoch, FaviconDriver, FaviconEffects};
     use dt_t3::favicon::*;
     struct Effects {
+        wall: FakeWall,
         jobs: mpsc::Sender<ClipJob>,
         first: AtomicBool,
         cancelled: (Mutex<bool>, std::sync::Condvar),
@@ -1185,6 +1186,9 @@ fn real_scheduler_holds_replaces_on_seek_allows_and_publishes_then_releases() {
         publications: AtomicUsize,
     }
     impl FaviconEffects for Effects {
+        fn wall_time(&self) -> Instant {
+            self.wall.now()
+        }
         fn encode(&self, job: ClipJob, _: &EncodeEpoch) -> Result<ReadyClip> {
             self.jobs.send(job.clone()).unwrap();
             if !self.first.swap(true, Ordering::SeqCst) {
@@ -1223,6 +1227,7 @@ fn real_scheduler_holds_replaces_on_seek_allows_and_publishes_then_releases() {
     let (mut writes, wall, _, _) = write_loop(audio.clone());
     let (jobs, receive) = mpsc::channel();
     let effects = Arc::new(Effects {
+        wall: wall.clone(),
         jobs,
         first: AtomicBool::new(false),
         cancelled: (Mutex::new(false), std::sync::Condvar::new()),
@@ -1235,6 +1240,7 @@ fn real_scheduler_holds_replaces_on_seek_allows_and_publishes_then_releases() {
         deck_b_project_id: Some("deck-b".into()),
         run_id: "test".into(),
         show_latency: Duration::from_millis(500),
+        first_show_latency: None,
         first_clip: Duration::from_secs(10),
         clip_seconds: Duration::from_secs(22),
         gate: true,
@@ -1757,4 +1763,81 @@ fn matching_ahead_result_is_passed_to_renderer_for_its_actual_grid_frame() {
         batch.is_some() && renderer.builds.lock().unwrap().last().unwrap().prepared
     });
     assert_eq!(renderer.builds.lock().unwrap().last().unwrap().first, 6);
+}
+
+#[test]
+fn favicon_thread_keeps_ticking_and_releases_audio_without_the_theme_owner() {
+    use crate::favicon::{EncodeEpoch, FaviconDriver, FaviconEffects, Scheduler};
+    use crate::favicon_thread::FaviconThread;
+    use dt_t3::favicon::*;
+    struct Capture(mpsc::Sender<usize>, usize);
+    impl Scheduler for Capture {
+        fn tick(&mut self, _: FaviconTick<'_>) -> Result<Vec<FaviconAction>> {
+            self.1 += 1;
+            self.0.send(self.1).unwrap();
+            Ok(match self.1 {
+                1 => vec![
+                    FaviconAction::HoldAudio {
+                        request_id: 1,
+                        deadline: Instant::now() + Duration::from_secs(6),
+                    },
+                    FaviconAction::SetFront(Some(Deck::B)),
+                    FaviconAction::RequestQuiet,
+                ],
+                3 => vec![FaviconAction::ReleaseAudio { at: None }],
+                _ => vec![],
+            })
+        }
+        fn stop(&mut self) -> Vec<FaviconAction> {
+            vec![]
+        }
+    }
+    struct NoEffects;
+    impl FaviconEffects for NoEffects {
+        fn encode(&self, _: ClipJob, _: &EncodeEpoch) -> Result<ReadyClip> {
+            panic!("unexpected encode")
+        }
+        fn publish(&self, _: &str, _: &std::path::Path) -> Result<()> {
+            panic!("unexpected publish")
+        }
+        fn blank(&self, _: &str, _: &std::path::Path) -> Result<()> {
+            panic!("unexpected blank")
+        }
+        fn cleanup(&self, _: &std::path::Path, _: usize) -> Result<()> {
+            panic!("unexpected cleanup")
+        }
+    }
+    let (mut p, audio, _) = player(&["a"]);
+    let (mut writes, _, _, _) = write_loop(audio.clone());
+    // No owner synchronization/render/command loop runs until four scheduler ticks have passed.
+    let (send, receive) = mpsc::channel();
+    let driver = FaviconDriver::new(Box::new(Capture(send, 0)), Arc::new(NoEffects)).unwrap();
+    let mut favicon = FaviconThread::start(driver, &p).unwrap();
+    for expected in 1..=4 {
+        assert_eq!(
+            receive.recv_timeout(Duration::from_secs(2)).unwrap(),
+            expected
+        );
+    }
+    assert!(audio.held.load(Ordering::SeqCst));
+    assert!(
+        audio
+            .release
+            .lock()
+            .unwrap()
+            .is_some_and(|at| at <= Instant::now())
+    );
+    // A seek invalidates both the queued presentation and the pending quiet request.
+    p.favicon_front = Some('b');
+    p.favicon_live = true;
+    p.favicon_allow = Some(vec!["glowtube-clip-b-obsolete.svg".into()]);
+    p.seek(1.0).unwrap();
+    writes.synchronize(&p).unwrap();
+    favicon.synchronize(&mut p, &mut writes);
+    assert_eq!(p.favicon_front, None);
+    assert!(!p.favicon_live);
+    assert_eq!(p.favicon_allow, Some(Vec::new()));
+    writes.tick(&mut p).unwrap();
+    assert!(writes.quiet_written_at().is_none());
+    favicon.stop().unwrap();
 }

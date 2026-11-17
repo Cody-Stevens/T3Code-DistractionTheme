@@ -48,10 +48,25 @@ frames, `VideoSource::begin_batch(k0)` anchors dt-media's retention rule at the 
 Card cache keys include title, effective subtitle, playing state and four visible upcoming rows.
 The transient message expires for card rendering but remains in status JSON, matching Python.
 Favicon encoding and API effects have separate workers so neither queues behind theme encoding.
+The scheduler itself runs every 20 ms on an independent thread, reading the native audible clock;
+theme/card construction cannot delay publication or audio release. The owner exchanges source
+snapshots, quiet grants and revision-tagged presentation changes with that thread. A discontinuity
+clears old presentation immediately and rejects messages from the previous revision.
 The real scheduler receives the player's jump counter, reported device latency, exact frozen
 position after `AudioHeld`, completed effects and landed quiet-write time. Holds arm an independent
 six-second audio failsafe. A successful first publication schedules release with device latency
 subtracted; release never changes the user's paused state. Status queries the actual audio gate.
+API completions carry their actual monotonic completion time, so delayed event consumption cannot
+shift the gate or deck-flip deadlines. The newest deck remains the planning base, each handover
+retains three seconds of overlap, and terminal clips hold through the fractional PCM tail until EOF.
+
+Native playback defaults to 0.4 seconds of show latency and a 0.3-second first-clip gate, measured
+with its AVIF output; Python uses 0.5 seconds for both. `GLOWTUBE_FAVICON_LATENCY` and
+`GLOWTUBE_FIRST_LATENCY` override these values. Set `GLOWTUBE_DEBUG=1` to log Unix wall
+timestamps, jumps, clip plans/start/end/deadlines, encoder duration, quiet request/grant, API
+publication with audio position, front flips and gate-release scheduling to stderr. The service
+captures stderr in `player.log`; direct playback can redirect it. Logs never include credentials or
+API response bodies.
 
 Theme and ahead clips use the native libavif backend. Long favicon jobs run in one warmed hidden
 child of this executable, owned by a dt-platform Job Object. Small bounded JSON requests carry
@@ -130,17 +145,22 @@ ordering without starting processes. Fake platform events and a fake favicon sch
 the dispatch and quiet-publication boundary. The real ThemeWriter is exercised in a temporary
 directory, and NativeEffects sends real T3 API requests to an ephemeral mock with a fake token.
 
-The only shared API change is the separate first commit: `dt_render::css::DynamicInput.extra_css`.
+The first shared API change is the separate first commit: `dt_render::css::DynamicInput.extra_css`.
 The renderer puts these complete rules in the head before calculating video room. This budgets
 the front-deck selector and allowed-file filter within the 49,500-character CSS limit.
+The sync follow-up separately adds `dt_t3::favicon::FaviconEvent::PublishedAt`; the original
+`Published` variant remains supported. `FaviconConfig.first_show_latency` optionally calibrates
+short first clips separately; `None` retains the common Python latency. Another small commit caches parsed card fonts and uses
+lossless WebP method 3: the isolated `card_cost` example measured 10-13 ms warm renders instead of
+426-534 ms with method 6, with 6,612-6,664 base64 characters. Palette and marker checks are unchanged.
 
 | Quality bar from RUST_PLAN.md | Evidence in this branch |
 | --- | --- |
 | 250 ms uncovered / 2 s covered audio grid, >=150 ms write gap | Exact fake-clock assertions; wall time alone cannot advance the grid. |
 | CSS <=49,500 UTF-16 units | Oversized themes are rejected before writing; native renderer tests include still video, all 60 glow/value frames, and per-write clip rules. The real ThemeWriter independently validates the document. |
-| Build median <100 ms, worst <200 ms | dt-render reports 91.7/113.0 ms over 20 release builds with a cached card. Full player timing under six-worker contention remains unmeasured; cold cards and difficult fallback scenes can exceed this budget. |
+| Build median <100 ms, worst <200 ms | The native `card_cost` example measures 10-13 ms warm changing-card renders. Live whole-player build costs are recorded in PR #6; cold cards and difficult fallback scenes can exceed the budget. |
 | Animated AVIF and quality versus Pillow | The native encoder is wired in. dt-render records Edge animation and matched-size PSNR comparisons in its README; the synthetic child test verifies native padded SVG output. |
-| Favicon 100% coverage, 95% of A/V offsets within 0.25 s, T3 latency <0.3 s median | Quiet handshake and covered cadence tested; live measurements remain. |
+| Favicon 100% coverage, 95% of A/V offsets within 0.25 s, T3 latency <0.3 s median | Quiet handshake and covered cadence tested; current live results and exact replay conditions are recorded in [PR #6](https://github.com/Cody-Stevens/T3Code-DistractionTheme/pull/6). |
 | Click targets 28/28 at both scales, <=1/400 false hits | dt-platform's synthetic 100%/150% target and 400-click noise tests pass in the workspace suite; input dispatch is tested here. Live GDI measurements remain. |
 | Card <=9 KB base64, pixel-exact markers | dt-render reports 7,764 base64 characters for its four-row Segoe sample; all marker pixels survive its round-trip tests. The native card/cache path is wired here. |
 
@@ -159,8 +179,11 @@ Setup uses `setup_decks` and reports when idle sidebar threads could not be prov
 - The measured cadence is fixed at 48 covered frames and a 2.2-second quiet hold; Python's
   `GLOWTUBE_COVERED_STEP` and `GLOWTUBE_QUIET_HOLD` tuning overrides are not implemented.
   Port, volume, gate, first/max clip lengths, show latency and measure/loading switches are wired.
-- Service logs contain event text without Python's timestamp/PID/exit-code detail.
-  `GLOWTUBE_DEBUG`'s detailed timing and ahead-counter logs are not ported.
+- Service lifecycle logs omit Python's timestamp/PID/exit-code detail. Player timing events are
+  available through `GLOWTUBE_DEBUG`; Python's periodic ahead-counter summary is not implemented.
+- The native show/gate latency defaults are 0.4/0.3 seconds rather than Python's 0.5 seconds. The scheduler
+  uses actual API completion timestamps and keeps the terminal picture through the fractional
+  PCM tail, avoiding a hold for an unencodable sub-second clip.
 - HTTP input and errors are bounded/redacted. Invalid numeric arguments return 400 rather than
   dropping the Python request handler. Successful routes and the twelve status fields match.
 - Native font rasterization/palette reduction can differ from Pillow. dt-render retains a fitted
@@ -168,6 +191,6 @@ Setup uses `setup_decks` and reports when idle sidebar threads could not be prov
   explore higher quality. Its generic libaom ahead encodes and cold card generation can cost more
   than Python's optimized build; see the renderer's measurements.
 
-No production test doubles or orchestration stubs remain. Live build costs, favicon coverage,
-A/V sync, T3 call latency and scaled clicks still need measurement using `python/tools/` after
-the player swap. No playback, setup, idle or service command was run against the live T3 setup.
+No production test doubles or orchestration stubs remain. Live playback measurements use the
+scratch helper's unmodified tools and source cache. Setup, idle and service were not run against
+live T3; playback alone writes the theme and the two deck favicons. Scaled click measurement remains.
