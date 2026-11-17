@@ -1,0 +1,25 @@
+[package]
+name = "distraction"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+dt-core.workspace = true
+dt-media.workspace = true
+dt-render.workspace = true
+dt-t3.workspace = true
+dt-platform.workspace = true
+# Derive the five-subcommand CLI; no runtime config writes during parsing.
+clap = { version = "4.5", features = ["derive", "env"] }
+# Blocking loopback HTTP for Python-compatible ctl; proxies and redirects are disabled.
+reqwest.workspace = true
+# Same JSON wire format as glowtube.serve; no bearer token needed on the helper's loopback API.
+serde.workspace = true
+serde_json.workspace = true
+# Planned blocking loopback server. Bind only 127.0.0.1; never use a wildcard listener.
+tiny_http = "0.12"
+
+[lints]
+workspace = true
