@@ -142,7 +142,8 @@ fn favicon(paths: T3Paths) -> Result<FaviconDriver> {
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
         .and_then(|s| Duration::try_from_secs_f64(s).ok())
-        .unwrap_or(Duration::from_millis(500));
+        // The independent 20 ms scheduler needs less lead than Python's 100 ms tick.
+        .unwrap_or(Duration::from_millis(450));
     let config = dt_t3::favicon::FaviconConfig {
         clips_dir: clips_dir.clone(),
         project_id: project.id.clone(),
