@@ -1351,6 +1351,7 @@ fn native_favicon_effects_use_explicit_projects_and_owned_paths_against_a_mock_a
                 Err(error) => panic!("mock accept failed: {error}"),
             });
             let mut stream = connection.unwrap();
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
