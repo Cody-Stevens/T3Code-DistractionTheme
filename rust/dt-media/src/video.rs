@@ -12,6 +12,7 @@ use std::{
     process::Stdio,
     sync::{Arc, Condvar, Mutex},
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 const RETAIN: u64 = FPS as u64 * 2;
@@ -27,6 +28,9 @@ pub struct VideoReaderConfig {
 
 /// Nonblocking frame lookup; seeks restart the pipe without waiting for a decoded frame.
 pub trait VideoSource: Send {
+    /// Pin retention to the first frame of a write before reading its frames with `get`.
+    /// Keeps two seconds before `min(batch_start, requested_frame)` until the next batch.
+    fn begin_batch(&mut self, frame: u64) -> Result<()>;
     /// Requested/nearest older RGB24 frame, or `None` while loading or restarting.
     fn get(&mut self, frame: u64) -> Result<Option<Arc<Frame>>>;
     /// Restart at a 24 fps frame index and invalidate the old buffer.
@@ -41,9 +45,22 @@ struct State {
     base: u64,
     decoded: u64,
     wanted: u64,
+    keep: u64,
+    started: Option<Instant>,
     stopped: bool,
     eof: bool,
     failed: bool,
+}
+
+impl State {
+    fn restart_needed(&self, frame: u64, now: Instant) -> bool {
+        let oldest = self.frames.first_key_value().map_or(self.base, |(&k, _)| k);
+        let fresh = self
+            .started
+            .is_some_and(|started| now.saturating_duration_since(started) < Duration::from_secs(1))
+            && frame.saturating_sub(self.base) <= u64::from(FPS) * 4;
+        frame < oldest || (frame > self.decoded.saturating_add(RETAIN) && !fresh)
+    }
 }
 
 /// Aspect-fill 640x360 RGB24 with two seconds of history and about two seconds of look-ahead.
@@ -97,7 +114,7 @@ fn pump(mut pipe: impl Read, shared: Arc<(Mutex<State>, Condvar)>) {
         };
         state.frames.insert(index, Arc::new(frame));
         state.decoded = state.decoded.saturating_add(1);
-        let oldest = state.wanted.saturating_sub(RETAIN);
+        let oldest = state.keep.min(state.wanted).saturating_sub(RETAIN);
         while state
             .frames
             .first_key_value()
@@ -123,6 +140,16 @@ impl VideoReader {
 }
 
 impl VideoSource for VideoReader {
+    fn begin_batch(&mut self, frame: u64) -> Result<()> {
+        let mut state = self
+            .shared
+            .0
+            .lock()
+            .map_err(|_| Error::Protocol("video buffer lock"))?;
+        state.keep = frame;
+        Ok(())
+    }
+
     fn get(&mut self, frame: u64) -> Result<Option<Arc<Frame>>> {
         let restart;
         {
@@ -147,11 +174,7 @@ impl VideoSource for VideoReader {
             if let Some(hit) = state.frames.get(&frame) {
                 return Ok(Some(Arc::clone(hit)));
             }
-            let oldest = state
-                .frames
-                .first_key_value()
-                .map_or(state.base, |(&k, _)| k);
-            restart = frame < oldest || frame > state.decoded.saturating_add(RETAIN);
+            restart = state.restart_needed(frame, Instant::now());
             if !restart {
                 return Ok(state
                     .frames
@@ -173,6 +196,8 @@ impl VideoSource for VideoReader {
                 base: frame,
                 decoded: frame,
                 wanted: frame,
+                keep: frame,
+                started: Some(Instant::now()),
                 ..State::default()
             }),
             Condvar::new(),
@@ -280,6 +305,7 @@ mod tests {
         {
             let mut s = shared.0.lock().unwrap();
             s.wanted = 100;
+            s.keep = 100;
             shared.1.notify_one();
         }
         until(&shared, |s| s.decoded == 149);
@@ -301,5 +327,78 @@ mod tests {
         let state = shared.0.lock().unwrap();
         assert!(state.eof && state.failed);
         assert!(state.frames.is_empty());
+    }
+
+    #[test]
+    fn batch_pattern_keeps_overlapping_writes_without_restarts() {
+        let shared = Arc::new((
+            Mutex::new(State {
+                started: Some(Instant::now()),
+                ..State::default()
+            }),
+            Condvar::new(),
+        ));
+        let worker_state = Arc::clone(&shared);
+        let mut reader = VideoReader {
+            // An unexpected restart fails immediately instead of launching an external tool.
+            config: VideoReaderConfig {
+                path: "unused".into(),
+                ffmpeg: PathBuf::new(),
+            },
+            shared: Arc::clone(&shared),
+            child: None,
+            worker: None,
+        };
+        reader.worker = Some(thread::spawn(move || {
+            pump(
+                Frames {
+                    bytes_left: 500 * FRAME_W as usize * FRAME_H as usize * 3,
+                },
+                worker_state,
+            )
+        }));
+        let starts = std::iter::once(0)
+            .chain((1..=6).map(|i| i * 6))
+            .chain((1..=6).map(|i| 36 + i * 48));
+        for start in starts {
+            reader.begin_batch(start).unwrap();
+            for frame in start..start + 60 {
+                reader.get(frame).unwrap();
+            }
+            // Let the pipe fill after each complete write, just as it does between writes.
+            until(&shared, |s| s.decoded == start + 60 + RETAIN);
+            let (has_start, oldest, count) = {
+                let state = shared.0.lock().unwrap();
+                (
+                    state.frames.contains_key(&start),
+                    *state.frames.first_key_value().unwrap().0,
+                    state.frames.len(),
+                )
+            };
+            assert!(has_start, "batch {start} discarded its own first frame");
+            assert_eq!(oldest, start.saturating_sub(RETAIN));
+            assert!(count <= 60 + 2 * RETAIN as usize);
+            assert!(
+                Arc::ptr_eq(&reader.shared, &shared),
+                "decoder restarted after its initial start"
+            );
+        }
+        reader.stop().unwrap();
+    }
+
+    #[test]
+    fn restart_grace_has_time_and_distance_bounds_and_never_blocks_backward_seeks() {
+        let now = Instant::now();
+        let state = State {
+            base: 100,
+            decoded: 100,
+            started: Some(now),
+            ..State::default()
+        };
+        assert!(!state.restart_needed(160, now));
+        assert!(!state.restart_needed(196, now + Duration::from_millis(999)));
+        assert!(state.restart_needed(197, now));
+        assert!(state.restart_needed(160, now + Duration::from_secs(1)));
+        assert!(state.restart_needed(99, now));
     }
 }

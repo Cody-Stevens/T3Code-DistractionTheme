@@ -24,11 +24,19 @@ The output stream lives on an owned device thread because platform stream handle
 
 `VideoReader.get` never waits for a decoded frame. It returns an exact hit, the nearest older
 frame, or `None` while a restart is loading. The pipe stops advancing when its decoded head is
-more than 48 frames ahead of the requested position. Each insertion discards frames older than
-`wanted - 48`, retaining about 97 frames / 64 MiB at steady state. A request older than the oldest
-retained frame restarts ffmpeg, including loops near EOF. Requests more than 48 frames beyond
-the decoded head also restart. Explicit seeks clear all prior frames. Stop/drop terminate and
-reap the owned process and join its worker; Windows termination uses `taskkill /T /F`.
+more than 48 frames ahead of the requested position. Before each write, call
+`reader.begin_batch(k0)?`, then read `k0..end` with `get`. Each insertion discards frames older
+than `min(batch_start, wanted) - 48`. Retention follows the write's start even when it reads 60
+frames ahead and the next write advances only six frames. With 60-frame writes, the buffer holds
+up to about 156 frames / 103 MiB. Update `begin_batch` for every write (or every standalone frame)
+so the retention boundary advances.
+
+A request older than the oldest retained frame restarts ffmpeg, including loops near EOF.
+Requests more than 48 frames beyond the decoded head also restart, except during the first
+second after a restart when they are within 96 frames of its starting frame. That grace period
+lets the initial batch finish requesting frames while ffmpeg starts decoding. Explicit seeks
+always restart and reset the buffer, retention boundary and grace period. Stop/drop terminate
+and reap the owned process and join its worker; Windows termination uses `taskkill /T /F`.
 
 ## Clock behavior
 
@@ -48,6 +56,20 @@ accuracy. `device_latency()` reports that estimate, which may exclude physical h
 This is the same kind of audible-position estimate as Python's callback anchor minus stream
 latency, rather than a measurement of sound leaving a speaker.
 
+The binary can hold music for the first favicon clip through `AudioOutput::hold()` and
+`release_at(Instant)`. Install a hold before starting, seeking, or resuming playback. Held
+callbacks emit silence, consume no PCM, and publish a frozen clock at the PCM cursor. Holds
+survive source replacement, seeks and pause/resume; those operations still update the frozen
+position normally. `gated()` lets the write loop choose a still frame while the deadline is
+pending. A new `hold()` cancels a previous scheduled release; `release_at` can replace a deadline,
+and past deadlines release on acknowledgement.
+
+Release allows audio on the first device callback at or after the monotonic deadline. The clock
+stays frozen until that callback submits PCM, then resumes its latency-adjusted interpolation.
+The deadline does not unpause playback. For a desired audible start time, the binary can subtract
+`device_latency()` from that time before scheduling release, as Python does. The binary owns the
+favicon publication decision and maximum hold timeout; dt-media applies neither automatically.
+
 ## Validation and measurements
 
 Measured on Windows on 2026-11-16 with an AMD Ryzen 9 9900X, Rust 1.98.0 (MSVC), and
@@ -64,6 +86,14 @@ checks its byte hash before comparing all 96 frames / 16 bands plus bass, kick, 
 absolute envelope tolerance is 0.0002; the measured maximum error was 0.000000886. Every ring
 radius matched exactly, including the kick-triggered resets. Empty, sub-frame, and silent inputs
 have separate coverage (Python raises on empty input; the Rust contract requires safe empty arrays).
+
+The 2026-11-17 follow-up replays 13 writes / 780 frame requests: an initial 60-frame write,
+six advances of six frames, then six advances of 48 frames, each reading 60 frames. The synthetic
+pipe retained every write's first frame with zero restarts after the initial start. Separate
+tests cover both restart-grace boundaries and backward seeks. Fake-output tests check indefinite
+holds, exact scheduled deadlines, frozen clocks without callbacks, source replacement, seeks,
+pause/resume, rescheduling, cancelled deadlines, past deadlines and latency after release.
+These regressions require no audio device, external tools or T3 state.
 
 ```powershell
 python dt-media/tests/generate_golden.py

@@ -55,6 +55,7 @@ fn real_pipe_seeks_loops_and_reaps() {
     );
     // Move the wanted position until frame zero is older than the two-second retained history.
     for i in 1..=125 {
+        reader.begin_batch(i).unwrap();
         frame(&mut reader, i);
     }
     assert!(
