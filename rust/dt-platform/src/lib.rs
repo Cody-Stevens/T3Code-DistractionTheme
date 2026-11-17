@@ -2,6 +2,7 @@
 //! No hooks, clipboard reads or process mutations occur at construction/import.
 //! Public signatures use std/core values so future platforms can implement the same contracts.
 
+pub mod autostart;
 pub mod input;
 pub mod process;
 

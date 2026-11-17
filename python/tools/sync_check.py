@@ -16,6 +16,7 @@ from PIL import ImageGrab
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from grab_t3 import find_t3  # noqa: E402
+import source_video  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 WINDOW = 8.0                        # search this many seconds either side of the audio time
@@ -39,7 +40,7 @@ def main(samples=6, seconds=0.0):
         img = ImageGrab.grab(bbox=box, all_screens=True).convert("RGB").resize((96, 54))
         shots.append((st["time"], np.asarray(img, float), st.get("front")))
         time.sleep(0.7)
-    video = str(ROOT / "cache" / "fDltPLFdkYI.mp4")
+    video = source_video.path()
     for t_audio, shot, front in shots:
         start = max(0.0, t_audio - WINDOW)
         raw = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{start:.2f}", "-i", video, "-an", "-t", str(2 * WINDOW), "-vf",

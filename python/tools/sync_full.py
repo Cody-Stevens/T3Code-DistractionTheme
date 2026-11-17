@@ -19,6 +19,7 @@ from PIL import ImageGrab
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from grab_t3 import find_t3  # noqa: E402
+import source_video  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 FPS = 8
@@ -29,7 +30,7 @@ def status() -> dict:
 
 
 def main(seconds: float, interval: float) -> None:
-    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", str(ROOT / "cache" / "fDltPLFdkYI.mp4"), "-an", "-vf",
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", source_video.path(), "-an", "-vf",
                           f"fps={FPS},scale=640:360,crop=384:216:128:72,scale=48:27", "-f", "rawvideo",
                           "-pix_fmt", "rgb24", "-"], capture_output=True, check=True).stdout
     src = np.frombuffer(raw, np.uint8).reshape(-1, 27, 48, 3).astype(float)

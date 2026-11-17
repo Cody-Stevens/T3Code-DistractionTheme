@@ -1,4 +1,4 @@
-//! clap surface for `play`, `ctl`, `setup`, `service` and `idle` from docs/RUST_PLAN.md.
+//! clap surface for `play`, `ctl`, `setup`, `service`, `idle`, `install` and `uninstall`.
 
 use clap::{Parser, Subcommand, ValueEnum};
 use dt_core::constants::CONTROL_PORT;
@@ -38,6 +38,11 @@ pub enum Command {
     Service,
     /// Write the idle theme.
     Idle,
+    /// Run setup, copy the helper to %LOCALAPPDATA%\GlowTube\bin, start the service now and at
+    /// every sign-in. T3 Code must be running.
+    Install,
+    /// Stop the service and remove the start-at-sign-in entry. Leaves the copied files.
+    Uninstall,
     /// Private warmed codec process; receives bounded JSON jobs on stdin, never T3 commands.
     #[command(hide = true)]
     InternalEncodeFavicon,
