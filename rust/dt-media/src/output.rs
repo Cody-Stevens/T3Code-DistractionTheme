@@ -268,6 +268,12 @@ impl Callback {
                 loaded: self.source.is_some(),
                 gate_release: self.gate_release.unwrap_or(0),
             });
+        } else if ack.is_some() {
+            // A no-op control still publishes device latency before acknowledging it, while
+            // preserving the final clock anchor when no new PCM was submitted.
+            let mut snapshot = self.shared.snapshot();
+            snapshot.latency = latency;
+            self.shared.publish(snapshot);
         }
         if let Some(serial) = ack {
             self.shared.ack.store(serial, SeqCst);
@@ -556,6 +562,20 @@ mod tests {
     }
 
     #[test]
+    fn no_op_pause_acknowledges_the_initial_device_latency() {
+        let (mut cb, mut commands, _) = fake();
+        commands.push((1, Control::Playing(false))).ok().unwrap();
+        let mut out = [1_i16; 960];
+        cb.render(&mut out, 1_000_000_000, 200_000_000);
+        assert_eq!(cb.shared.ack.load(SeqCst), 1);
+        let snapshot = cb.shared.snapshot();
+        assert_eq!(snapshot.latency, 200_000_000);
+        assert_eq!(snapshot.at(2_000_000_000), Duration::ZERO);
+        assert!(!snapshot.running);
+        assert_eq!(out, [0; 960]);
+    }
+
+    #[test]
     fn latency_interpolation_clamps_and_freezes() {
         let s = Snapshot {
             start: 48000,
@@ -617,22 +637,25 @@ mod tests {
         let final_anchor = cb.shared.snapshot().wall;
         cb.render(&mut out, 30_000_000, 10_000_000);
         assert_eq!(cb.shared.snapshot().wall, final_anchor);
+        commands.push((3, Control::Volume(1.0))).ok().unwrap();
+        cb.render(&mut out, 40_000_000, 10_000_000);
+        assert_eq!(cb.shared.snapshot().wall, final_anchor);
         assert_eq!(
             cb.shared.snapshot().at(100_000_000),
             Duration::from_micros(12500)
         );
-        commands.push((3, Control::Seek(96))).ok().unwrap();
+        commands.push((4, Control::Seek(96))).ok().unwrap();
         cb.render(&mut out, 100_000_000, 10_000_000);
         assert_eq!(
             cb.shared.snapshot().at(100_000_000),
             Duration::from_millis(2)
         );
-        commands.push((4, Control::Playing(false))).ok().unwrap();
+        commands.push((5, Control::Playing(false))).ok().unwrap();
         cb.render(&mut out, 105_000_000, 10_000_000);
         let paused = cb.shared.snapshot();
         assert_eq!(paused.at(200_000_000), paused.at(105_000_000));
         assert!(out.iter().all(|&v| v == 0.0));
-        commands.push((5, Control::Source(None))).ok().unwrap();
+        commands.push((6, Control::Source(None))).ok().unwrap();
         cb.render(&mut out, 210_000_000, 0);
         assert_eq!(Arc::strong_count(&source), 2);
         drop(retired.pop().unwrap());
