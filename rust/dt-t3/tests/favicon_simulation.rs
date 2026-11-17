@@ -736,7 +736,7 @@ fn missing_hold_ack_releases_at_deadline_without_immediately_holding_again() {
 }
 
 #[test]
-fn publish_requires_ack_and_output_latency_is_subtracted_from_release() {
+fn delayed_publish_ack_uses_completion_time_and_subtracts_output_latency() {
     for latency in [0.0, 0.1, 0.8] {
         let track = track(100);
         let mut scheduler = FaviconScheduler::new(config());
@@ -793,9 +793,12 @@ fn publish_requires_ack_and_output_latency_is_subtracted_from_release() {
         )));
         let mut input = snapshot(
             &track,
-            wall + seconds(3.2),
+            wall + seconds(3.8),
             0.0,
-            vec![FaviconEvent::Published(job.output)],
+            vec![FaviconEvent::PublishedAt {
+                path: job.output,
+                wall_time: wall + seconds(3.2),
+            }],
         );
         input.output_latency = seconds(latency);
         let actions = scheduler.tick(input).unwrap();
@@ -807,6 +810,35 @@ fn publish_requires_ack_and_output_latency_is_subtracted_from_release() {
         );
         assert_eq!(scheduler.front(), Some(Deck::A));
     }
+}
+
+#[test]
+fn newest_deck_plan_overlaps_and_reaches_the_track_end() {
+    let track = track(241);
+    let mut sim = Simulation::new();
+    sim.run_until(&track, 240.8);
+    assert!(sim.scheduler.front_clip().unwrap().end() >= seconds(241.0));
+    for pair in sim.jobs.windows(2) {
+        assert_ne!(pair[0].deck, pair[1].deck);
+        let overlap =
+            (pair[0].start + pair[0].duration).as_secs_f64() - pair[1].start.as_secs_f64();
+        assert!((overlap - 3.0).abs() < 0.05, "handover {overlap}");
+    }
+    sim.media = 241.03; // The PCM tail extends beyond the final complete video frame.
+    let actions = sim.step(Some(&track));
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, FaviconAction::HoldAudio { .. }))
+    );
+    assert!(sim.scheduler.front().is_some());
+    sim.seek(0.0);
+    let actions = sim.step(Some(&track));
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, FaviconAction::HoldAudio { .. }))
+    );
 }
 
 #[test]

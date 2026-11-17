@@ -126,6 +126,13 @@ pub enum FaviconEvent {
     EncodeFailed(ClipJob),
     /// Publication succeeded. Only this acknowledgment commits the deck's new clip/file.
     Published(PathBuf),
+    /// Publication completed on the API worker at this wall time, before a later owner tick.
+    PublishedAt {
+        /// Successfully published clip path.
+        path: PathBuf,
+        /// Actual API completion timestamp; do not replace it with event-consumption time.
+        wall_time: Instant,
+    },
     /// Publication failed; the deck keeps its previous clip/file.
     PublishFailed(PathBuf),
     /// Audio is silent and its clock frozen; encode the first clip at this exact position.
@@ -368,7 +375,12 @@ impl FaviconScheduler {
             || self.front_clip().is_some_and(|clip| {
                 clip.job.track_id != track.id
                     || now < clip.job.start.as_secs_f64() - 0.6
-                    || input.media_time >= clip.end()
+                    // PCM can outlast the last complete video frame by a fraction of a frame.
+                    // Keep the terminal picture until the player advances the track; restarting
+                    // here would hold the clock with less than one second left to encode.
+                    || (input.media_time >= clip.end()
+                        && clip.end().as_secs_f64()
+                            < track.frames as f64 / f64::from(FPS) - 0.5)
             })
         {
             self.restart(&mut actions);
@@ -395,7 +407,14 @@ impl FaviconScheduler {
                         now = media_time.as_secs_f64();
                     }
                 }
-                FaviconEvent::Published(path) => {
+                FaviconEvent::Published(_) | FaviconEvent::PublishedAt { .. } => {
+                    let (path, published_at) = match event {
+                        FaviconEvent::Published(path) => (path, input.wall_time),
+                        FaviconEvent::PublishedAt { path, wall_time } => {
+                            (path, wall_time.min(input.wall_time))
+                        }
+                        _ => unreachable!(),
+                    };
                     if self
                         .publishing
                         .as_ref()
@@ -406,7 +425,7 @@ impl FaviconScheduler {
                         if let Some(gate) = &mut self.gate
                             && gate.release_at.is_none()
                         {
-                            let at = (input.wall_time
+                            let at = (published_at
                                 + self
                                     .config
                                     .show_latency
@@ -417,7 +436,7 @@ impl FaviconScheduler {
                         }
                         self.decks[deck.index()] = DeckState {
                             clip: Some(clip),
-                            published_at: Some(input.wall_time),
+                            published_at: Some(published_at),
                             blank: false,
                         };
                         self.allow(&mut actions);
@@ -687,6 +706,9 @@ impl FaviconScheduler {
             None
         };
         let Some((prev_start, prev_end, deck, ready_at)) = previous else {
+            if now > track.frames as f64 / f64::from(FPS) - 1.0 {
+                return;
+            }
             if self.config.gate && gate_allowed {
                 if self.gate.is_none() {
                     self.gate_sequence += 1;
