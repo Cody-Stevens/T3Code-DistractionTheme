@@ -1,0 +1,22 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Rust
+rust/target/
+target/
+
+# Media and runtime output (never commit downloaded videos or rendered clips)
+cache/
+clips/
+shots/
+*.log
+.resume
+
+# Secrets and local config
+.env
+.env.*
+*token*
+!**/*token*.rs
+!**/*token*.py
