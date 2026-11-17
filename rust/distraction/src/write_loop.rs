@@ -28,6 +28,8 @@ impl WallClock for SystemWallClock {
     }
 }
 
+/// Frames between covered writes; twelve spare frames extend their glow/values to 2.5 seconds.
+pub const COVERED_STEP: u64 = 48;
 /// Python's build estimate, signed display offset, next_k and quiet hold.
 #[derive(Clone, Debug)]
 pub struct WriteTiming {
@@ -37,6 +39,8 @@ pub struct WriteTiming {
     pub display_offset: f64,
     /// Next frame on the six-frame grid anchored at the last batch.
     pub next_frame: Option<u64>,
+    /// Active audio-grid stride: six frames uncovered, 48 frames under a favicon clip.
+    pub step_frames: u64,
     /// Monotonic hold deadline.
     pub hold_until: Option<Instant>,
 }
@@ -46,6 +50,7 @@ impl Default for WriteTiming {
             build_estimate: Duration::from_millis(150),
             display_offset: 0.16,
             next_frame: None,
+            step_frames: u64::from(WRITE_STEP_FRAMES),
             hold_until: None,
         }
     }
@@ -261,13 +266,19 @@ impl WriteLoop {
             room: 30000,
         })
     }
-    /// A scheduler request remains pending until a successful long write lands.
+    /// Request a tagged quiet batch; an unchanged held theme can acknowledge without rewriting.
     pub fn request_quiet(&mut self) {
         self.quiet_requested = true;
     }
-    /// Grant time is in the future for 450 ms after the long write; scheduler must check it.
+    /// Earliest publication time, 450 ms after acknowledgement; the bridge checks this deadline.
     pub fn quiet_granted_at(&self) -> Option<Instant> {
         self.quiet_granted
+    }
+    /// Time the acknowledged quiet batch completed, before its 450 ms settle delay.
+    /// dt-t3's current FaviconTick contract expects this landed time.
+    pub fn quiet_written_at(&self) -> Option<Instant> {
+        self.quiet_granted
+            .and_then(|grant| grant.checked_sub(QUIET_SETTLE))
     }
     /// Clear source-dependent results and quiet permissions on seek/pause/source changes.
     pub fn invalidate(&mut self) -> Result<()> {
@@ -289,7 +300,12 @@ impl WriteLoop {
             }
             self.revision = Some(player.revision);
         }
-        self.playing = player.playing;
+        let moving = player.playing && !player.held;
+        if self.playing != moving {
+            self.timing.next_frame = None;
+            self.ahead.clear();
+        }
+        self.playing = moving;
         self.timing.display_offset = player.offset;
         Ok(())
     }
@@ -297,7 +313,7 @@ impl WriteLoop {
     pub fn synchronize(&mut self, player: &Player) -> Result<()> {
         self.sync(player)
     }
-    /// Build eight frames, one paused frame, or exactly 60 frames for a pending quiet request.
+    /// Build ordinary/covered/quiet spans; held or paused audio uses a still at its exact position.
     pub fn batch(&mut self, player: &mut Player) -> Result<Option<BuiltTheme>> {
         self.batch_quiet = false;
         self.sync(player)?;
@@ -307,23 +323,31 @@ impl WriteLoop {
         if self.reader.is_none() {
             self.reader = Some(self.renderer.video(&track.info)?);
         }
-        let is_quiet = player.playing && self.quiet_requested;
-        let count = if is_quiet {
-            (QUIET_CONTENT.as_secs_f64() * f64::from(FPS)).round() as u64
-        } else if player.playing {
-            u64::from(WRITE_SPAN_FRAMES)
+        let is_quiet = self.quiet_requested;
+        self.batch_quiet = is_quiet;
+        let moving = player.playing && !player.held;
+        let covered = moving && player.favicon_live && !is_quiet;
+        let step = if covered {
+            COVERED_STEP
         } else {
+            u64::from(WRITE_STEP_FRAMES)
+        };
+        let count = if !moving {
             1
+        } else if is_quiet {
+            (QUIET_CONTENT.as_secs_f64() * f64::from(FPS)).round() as u64
+        } else {
+            step + if covered { 12 } else { 2 }
         };
         let time = self.clock.media_time().as_secs_f64();
-        let start = if player.playing {
+        let start = if moving {
             time + self.timing.build_estimate.as_secs_f64() + self.timing.display_offset
         } else {
             time
         };
         let mut k0 = (start * f64::from(FPS)).round_ties_even().max(0.0) as u64;
         k0 = k0.min(track.info.frames - 1);
-        if player.playing
+        if moving
             && let Some(next) = self
                 .timing
                 .next_frame
@@ -331,8 +355,8 @@ impl WriteLoop {
         {
             k0 = next;
         }
-        let cheap = player.favicon_live || is_quiet;
-        let prepared = if player.playing && !cheap {
+        let cheap = player.favicon_live || (player.playing && is_quiet);
+        let prepared = if moving && !cheap {
             self.ahead.take(&track.info.id, k0)
         } else {
             None
@@ -390,8 +414,6 @@ impl WriteLoop {
         if frames.is_empty() {
             return Ok(None);
         }
-        // A short tail or missing initial video frames cannot promise 2.5 seconds of coverage.
-        let long_coverage = is_quiet && frames.len() == count as usize;
         let elapsed = k0 / u64::from(FPS);
         let total = track.info.frames / u64::from(FPS);
         let clock = format!(
@@ -407,7 +429,10 @@ impl WriteLoop {
             format!("{}  ·  {clock}", track.info.artist)
         };
         let content = player.card_content(subtitle, self.wall.now());
-        let extra = front_css(player.favicon_front);
+        let extra = favicon_css(player.favicon_front, player.favicon_allow.as_deref())?;
+        if player.favicon_live && (covered || is_quiet) {
+            frames.truncate(1);
+        }
         let built = self.renderer.build(
             content,
             RenderBatch {
@@ -430,8 +455,9 @@ impl WriteLoop {
                 self.ahead.stats.too_big += 1;
             }
         }
-        if player.playing && !is_quiet {
-            self.timing.next_frame = Some(k0 + u64::from(WRITE_STEP_FRAMES));
+        if moving && !is_quiet {
+            self.timing.next_frame = Some(k0 + step);
+            self.timing.step_frames = step;
             if !cheap {
                 for n in 1..=AHEAD_WRITES {
                     let start = k0 + n as u64 * u64::from(WRITE_STEP_FRAMES);
@@ -467,10 +493,9 @@ impl WriteLoop {
             self.timing.next_frame = None;
             self.ahead.clear();
         }
-        self.batch_quiet = long_coverage;
         Ok(Some(built))
     }
-    /// Audio-grid delay, clamped to 0..500 ms; never derive it from wall uptime.
+    /// Audio-grid delay, clamped to twice the active stride; held audio waits 250 ms.
     pub fn until_next(&self) -> Duration {
         let Some(next) = self.timing.next_frame.filter(|_| self.playing) else {
             return WRITE_INTERVAL;
@@ -478,7 +503,10 @@ impl WriteLoop {
         let ideal = self.clock.media_time().as_secs_f64()
             + self.timing.build_estimate.as_secs_f64()
             + self.timing.display_offset;
-        Duration::from_secs_f64((next as f64 / f64::from(FPS) - ideal).clamp(0.0, 0.5))
+        Duration::from_secs_f64(
+            (next as f64 / f64::from(FPS) - ideal)
+                .clamp(0.0, 2.0 * self.timing.step_frames as f64 / f64::from(FPS)),
+        )
     }
     /// Delay until work can run, combining audio scheduling with monotonic safety holds.
     pub fn delay(&self, player: &Player) -> Duration {
@@ -504,7 +532,7 @@ impl WriteLoop {
         }
         delay
     }
-    /// One bounded owner iteration; acknowledge ONLY a successful long batch write.
+    /// One owner iteration; only a tagged quiet batch can acknowledge a window.
     pub fn tick(&mut self, player: &mut Player) -> Result<bool> {
         self.sync(player)?;
         if !self.delay(player).is_zero() {
@@ -512,29 +540,40 @@ impl WriteLoop {
         }
         let started = self.wall.now();
         let result = self.batch(player);
-        let long_batch = result.as_ref().is_ok_and(|theme| theme.is_some()) && self.batch_quiet;
+        let mut quiet_batch = self.batch_quiet;
         let built = match result {
             Ok(Some(built)) => {
-                self.next_idle = if !player.playing || self.timing.next_frame.is_none() {
+                self.next_idle = if !self.playing || self.timing.next_frame.is_none() {
                     Some(self.wall.now() + WRITE_INTERVAL)
                 } else {
                     None
                 };
                 built
             }
-            Ok(None) | Err(_) => {
-                self.batch_quiet = false;
+            result => {
+                if result.is_err() {
+                    quiet_batch = false;
+                }
                 self.timing.next_frame = None;
                 self.next_idle = Some(self.wall.now() + WRITE_INTERVAL);
-                let subtitle = if player.track().is_some() {
-                    "Loading…"
+                if player.playing && player.ready().is_some() && self.last_css.is_some() {
+                    // A catch-up miss preserves every layer of the current theme, including clip rules.
+                    BuiltTheme {
+                        css: self.last_css.clone().expect("existing theme"),
+                        video_room: self.room,
+                    }
                 } else {
-                    "Copy a YouTube link, then press Play"
-                };
-                self.renderer.idle(
-                    player.card_content(subtitle.into(), self.wall.now()),
-                    &front_css(player.favicon_front),
-                )?
+                    quiet_batch = false;
+                    let subtitle = if player.track().is_some() {
+                        "Loading…"
+                    } else {
+                        "Copy a YouTube link, then press Play"
+                    };
+                    self.renderer.idle(
+                        player.card_content(subtitle.into(), self.wall.now()),
+                        &favicon_css(player.favicon_front, player.favicon_allow.as_deref())?,
+                    )?
+                }
             }
         };
         let measured = self
@@ -545,30 +584,33 @@ impl WriteLoop {
         self.timing.build_estimate = Duration::from_secs_f64(
             0.7 * self.timing.build_estimate.as_secs_f64() + 0.3 * measured,
         );
-        if built.css.chars().count() > CSS_LIMIT {
+        if built.css.encode_utf16().count() > CSS_LIMIT {
             self.batch_quiet = false;
             return Err(Error::InvalidInput("theme exceeds CSS limit"));
         }
         player.dirty = false;
-        if self.last_css.as_ref() == Some(&built.css) {
-            return Ok(false);
+        let changed = self.last_css.as_ref() != Some(&built.css);
+        if changed {
+            if let Err(error) = self.sink.write(&built) {
+                player.dirty = true;
+                self.batch_quiet = false;
+                self.timing.next_frame = None;
+                return Err(error);
+            }
+            self.last_write = Some(self.wall.now());
+            self.last_css = Some(built.css);
         }
-        if let Err(error) = self.sink.write(&built) {
-            player.dirty = true;
-            self.batch_quiet = false;
-            self.timing.next_frame = None;
-            return Err(error);
-        }
-        let written = self.wall.now();
-        self.last_write = Some(written);
-        self.last_css = Some(built.css);
-        if long_batch && self.quiet_requested {
+        // A tagged held-still batch can grant an already quiet theme without rewriting it.
+        if quiet_batch && self.quiet_requested {
+            let granted = self.wall.now();
             self.quiet_requested = false;
             self.batch_quiet = false;
-            self.timing.hold_until = Some(written + QUIET_HOLD);
-            self.quiet_granted = Some(written + QUIET_SETTLE);
+            self.timing.next_frame = None;
+            self.next_idle = Some(granted + WRITE_INTERVAL);
+            self.timing.hold_until = Some(granted + QUIET_HOLD);
+            self.quiet_granted = Some(granted + QUIET_SETTLE);
         }
-        Ok(true)
+        Ok(changed)
     }
     /// Simple embedding loop; native runtime adds HTTP/input/favicon dispatch around tick.
     pub fn run(&mut self, player: &mut Player) -> Result<()> {
@@ -616,7 +658,7 @@ impl WriteLoop {
             },
             "",
         )?;
-        if theme.css.chars().count() > CSS_LIMIT {
+        if theme.css.encode_utf16().count() > CSS_LIMIT {
             return Err(Error::InvalidInput("theme exceeds CSS limit"));
         }
         self.sink.write(&theme)
@@ -631,8 +673,30 @@ impl Drop for WriteLoop {
 pub fn front_css(deck: Option<char>) -> String {
     match deck {
         Some(deck @ ('a' | 'b')) => {
-            format!("img[src*=\"glowtube-clip-{deck}-\"]{{z-index:2147483001!important}}")
+            format!(
+                "img[src*=\"glowtube-clip-\"]{{opacity:.01!important}}img[src*=\"glowtube-clip-{deck}-\"]{{opacity:1!important;z-index:2147483001!important}}"
+            )
         }
         _ => String::new(),
     }
+}
+
+/// Complete per-write favicon rules, including Python's stale-file visibility filter.
+pub fn favicon_css(front: Option<char>, allowed: Option<&[String]>) -> Result<String> {
+    let mut css = front_css(front);
+    if let Some(files) = allowed {
+        css.push_str("img[src*=\"glowtube-clip-\"]");
+        for name in files {
+            if name.is_empty()
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+            {
+                return Err(Error::InvalidInput("invalid favicon basename"));
+            }
+            css.push_str(&format!(":not([src*=\"{name}\"])"));
+        }
+        css.push_str("{visibility:hidden!important}");
+    }
+    Ok(css)
 }

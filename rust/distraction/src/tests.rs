@@ -162,6 +162,7 @@ impl WallClock for FakeWall {
 #[derive(Clone, Debug)]
 struct Build {
     count: usize,
+    glows: usize,
     first: u8,
     cheap: bool,
     extra: String,
@@ -174,6 +175,7 @@ struct RenderState {
     missing: AtomicBool,
     fail: AtomicBool,
     oversized: AtomicBool,
+    unchanged: AtomicBool,
     stops: AtomicUsize,
     cost_ms: AtomicU64,
     wall: Mutex<Option<FakeWall>>,
@@ -217,6 +219,7 @@ impl Renderer for FakeRenderer {
         let mut builds = self.0.builds.lock().unwrap();
         builds.push(Build {
             count: input.frames.len(),
+            glows: input.glows.len(),
             first: input.frames[0].pixels()[0],
             cheap: input.cheap,
             extra: input.extra_css.into(),
@@ -227,7 +230,15 @@ impl Renderer for FakeRenderer {
             css: if self.0.oversized.load(Ordering::SeqCst) {
                 "x".repeat(CSS_LIMIT + 1)
             } else {
-                format!(":root{{--seq:{}}}{}", builds.len(), input.extra_css)
+                format!(
+                    ":root{{--seq:{}}}{}",
+                    if self.0.unchanged.load(Ordering::SeqCst) {
+                        1
+                    } else {
+                        builds.len()
+                    },
+                    input.extra_css
+                )
             },
             video_room: 30000,
         })
@@ -512,18 +523,19 @@ fn failed_long_build_idle_fallback_and_failed_write_never_grant() {
     assert!(writes.quiet_granted_at().is_some());
 }
 #[test]
-fn ordinary_paused_write_does_not_open_pending_window_and_idle_has_no_stale_flag() {
+fn ordinary_paused_and_initial_empty_batches_do_not_open_a_window() {
     let (mut p, audio, _) = player(&["a"]);
     p.offset = 0.0;
     p.set_playing(false).unwrap();
-    let (mut writes, wall, renderer, _) = write_loop(audio);
-    writes.request_quiet();
+    let (mut writes, wall, renderer, _) = write_loop(audio.clone());
     assert!(writes.tick(&mut p).unwrap());
     assert_eq!(renderer.builds.lock().unwrap()[0].count, 1);
     assert!(writes.quiet_granted_at().is_none());
     p.set_playing(true).unwrap();
     wall.advance(250);
     writes.synchronize(&p).unwrap();
+    // A fresh loop has no existing CSS to keep when the decoder is catching up.
+    let (mut writes, _, renderer, _) = write_loop(audio);
     writes.request_quiet();
     renderer.missing.store(true, Ordering::SeqCst);
     assert!(writes.tick(&mut p).unwrap());
@@ -549,10 +561,10 @@ fn seek_resets_grid_and_cheap_mode_and_css_cap_are_enforced() {
     assert!(writes.tick(&mut p).is_err());
     assert_eq!(sink.writes.lock().unwrap().len(), 2);
     audio.millis.store(0, Ordering::SeqCst);
-    assert!(writes.until_next() <= Duration::from_millis(500));
+    assert!(writes.until_next() <= Duration::from_secs(4));
 }
 #[test]
-fn short_tail_cannot_acknowledge_full_quiet_coverage() {
+fn tagged_quiet_batch_can_grant_at_the_track_tail() {
     let (mut p, audio, _) = player(&["a"]);
     p.offset = 0.0;
     audio.millis.store(9000, Ordering::SeqCst);
@@ -560,7 +572,7 @@ fn short_tail_cannot_acknowledge_full_quiet_coverage() {
     writes.request_quiet();
     assert!(writes.tick(&mut p).unwrap());
     assert_eq!(renderer.builds.lock().unwrap()[0].count, 24);
-    assert!(writes.quiet_granted_at().is_none());
+    assert!(writes.quiet_granted_at().is_some());
 }
 #[test]
 fn ahead_nonblocking_matching_slack_invalidation_and_join() {
@@ -645,8 +657,8 @@ fn loopback_server_routes_exact_json_and_unknown_and_query_encoding() {
     assert_eq!(
         keys,
         [
-            "chaos", "index", "offset", "playing", "quality", "queue", "status", "time", "track",
-            "volume"
+            "chaos", "front", "held", "index", "offset", "playing", "quality", "queue", "status",
+            "time", "track", "volume"
         ]
     );
     assert!(!p.dirty);
@@ -898,11 +910,15 @@ fn favicon_bridge_never_publishes_after_ordinary_write_or_before_settle() {
     use std::collections::VecDeque;
     struct FakeScheduler(Arc<Mutex<VecDeque<Vec<FaviconAction>>>>);
     impl Scheduler for FakeScheduler {
-        fn tick(&mut self, _: FaviconTick<'_>) -> Result<Vec<FaviconAction>> {
+        fn tick(&mut self, _: FaviconTick<'_>, _: u64) -> Result<Vec<FaviconAction>> {
             Ok(self.0.lock().unwrap().pop_front().unwrap_or_default())
         }
         fn stop(&mut self) -> Vec<FaviconAction> {
-            vec![]
+            vec![FaviconAction::Blank {
+                deck: Deck::B,
+                project_id: "project-b".into(),
+                path: "glowtube-blank.svg".into(),
+            }]
         }
     }
     #[derive(Default)]
@@ -914,15 +930,17 @@ fn favicon_bridge_never_publishes_after_ordinary_write_or_before_settle() {
         fn encode(&self, job: ClipJob) -> Result<ReadyClip> {
             Ok(ReadyClip { job, frames: 144 })
         }
-        fn publish(&self, _: &std::path::Path) -> Result<()> {
+        fn publish(&self, project: &str, _: &std::path::Path) -> Result<()> {
+            assert_eq!(project, "project-b");
             self.publishes.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
-        fn blank(&self) -> Result<()> {
+        fn blank(&self, project: &str, _: &std::path::Path) -> Result<()> {
+            assert_eq!(project, "project-b");
             self.blanks.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
-        fn cleanup(&self) -> Result<()> {
+        fn cleanup(&self, _: &std::path::Path, _: usize) -> Result<()> {
             Ok(())
         }
     }
@@ -934,9 +952,11 @@ fn favicon_bridge_never_publishes_after_ordinary_write_or_before_settle() {
     let mut favicon =
         FaviconDriver::new(Box::new(FakeScheduler(actions.clone())), effects.clone()).unwrap();
     let publish = || {
-        vec![FaviconAction::Publish(PathBuf::from(
-            "glowtube-clip-b-test.svg",
-        ))]
+        vec![FaviconAction::Publish {
+            deck: Deck::B,
+            project_id: "project-b".into(),
+            path: "glowtube-clip-b-test.svg".into(),
+        }]
     };
     assert!(writes.tick(&mut p).unwrap());
     actions.lock().unwrap().push_back(publish());
@@ -1046,7 +1066,7 @@ fn child_shutdown_requests_quit_then_waits_then_kills_whole_tree() {
         events: vec![],
     };
     stop_owned_child(&mut child).unwrap();
-    assert_eq!(child.events, ["quit"]);
+    assert_eq!(child.events, ["quit", "kill tree and reap"]);
     assert_eq!(child.now, Duration::from_millis(150));
     let mut child = Child {
         now: Duration::ZERO,
@@ -1057,6 +1077,350 @@ fn child_shutdown_requests_quit_then_waits_then_kills_whole_tree() {
     stop_owned_child(&mut child).unwrap();
     assert_eq!(child.events, ["quit", "kill tree and reap"]);
     assert_eq!(child.now, Duration::ZERO);
+    let mut child = Child {
+        now: Duration::ZERO,
+        exit_after: Some(Duration::ZERO),
+        quit_ok: true,
+        events: vec![],
+    };
+    stop_owned_child(&mut child).unwrap();
+    assert_eq!(child.events, ["kill tree and reap"]);
+}
+
+#[test]
+fn covered_batches_use_one_video_frame_and_sixty_glow_and_value_frames() {
+    let (mut p, audio, _) = player(&["a"]);
+    p.offset = 0.0;
+    p.favicon_live = true;
+    let (mut writes, wall, renderer, _) = write_loop(audio.clone());
+    assert!(writes.tick(&mut p).unwrap());
+    {
+        let builds = renderer.builds.lock().unwrap();
+        let b = &builds[0];
+        assert_eq!((b.count, b.glows, b.values.len()), (1, 60, 60));
+        assert!(b.cheap);
+        assert!(!b.prepared);
+        assert!(b.values[59].contains_key("pr"));
+    }
+    assert_eq!(writes.timing.next_frame, Some(48));
+    assert_eq!(writes.until_next(), Duration::from_secs(2));
+    wall.advance(2000);
+    assert!(!writes.tick(&mut p).unwrap());
+    audio.millis.store(2000, Ordering::SeqCst);
+    assert!(writes.tick(&mut p).unwrap());
+    assert_eq!(renderer.builds.lock().unwrap()[1].first, 48);
+    writes.timing.next_frame = Some(1000);
+    assert_eq!(writes.until_next(), Duration::from_secs(4));
+    // An uncovered grid keeps the old half-second cap.
+    p.favicon_live = false;
+    writes.batch(&mut p).unwrap();
+    assert_eq!(writes.timing.step_frames, 6);
+    writes.timing.next_frame = Some(1000);
+    assert_eq!(writes.until_next(), Duration::from_millis(500));
+}
+
+#[test]
+fn covered_quiet_batch_has_still_video_and_animated_glow() {
+    let (mut p, audio, _) = player(&["a"]);
+    p.offset = 0.0;
+    p.favicon_live = true;
+    let (mut writes, wall, renderer, _) = write_loop(audio);
+    writes.request_quiet();
+    assert!(writes.tick(&mut p).unwrap());
+    let builds = renderer.builds.lock().unwrap();
+    assert_eq!(
+        (builds[0].count, builds[0].glows, builds[0].values.len()),
+        (1, 60, 60)
+    );
+    assert!(builds[0].cheap);
+    assert_eq!(writes.quiet_written_at(), Some(wall.now()));
+    assert_eq!(writes.quiet_granted_at(), Some(wall.now() + QUIET_SETTLE));
+}
+
+#[test]
+fn held_audio_builds_at_the_frozen_position_without_advancing_the_grid() {
+    let (mut p, audio, _) = player(&["a"]);
+    p.held = true;
+    p.offset = 0.8;
+    audio.millis.store(1500, Ordering::SeqCst);
+    let (mut writes, wall, renderer, _) = write_loop(audio);
+    writes.timing.build_estimate = Duration::from_millis(900);
+    assert!(writes.tick(&mut p).unwrap());
+    assert_eq!(writes.timing.next_frame, None);
+    assert_eq!(writes.until_next(), WRITE_INTERVAL);
+    wall.advance(250);
+    assert!(writes.tick(&mut p).unwrap());
+    let builds = renderer.builds.lock().unwrap();
+    assert!(
+        builds
+            .iter()
+            .all(|b| b.count == 1 && b.glows == 1 && b.first == 36)
+    );
+    assert!(p.status().held);
+    assert!(p.status().playing);
+}
+
+#[test]
+fn unchanged_held_batch_grants_only_when_tagged_for_a_quiet_window() {
+    let (mut p, audio, _) = player(&["a"]);
+    p.held = true;
+    let (mut writes, wall, renderer, sink) = write_loop(audio);
+    renderer.unchanged.store(true, Ordering::SeqCst);
+    assert!(writes.tick(&mut p).unwrap());
+    wall.advance(250);
+    assert!(!writes.tick(&mut p).unwrap());
+    assert!(writes.quiet_granted_at().is_none());
+    writes.request_quiet();
+    wall.advance(250);
+    assert!(!writes.tick(&mut p).unwrap());
+    assert_eq!(sink.writes.lock().unwrap().len(), 1);
+    assert_eq!(writes.quiet_granted_at(), Some(wall.now() + QUIET_SETTLE));
+    assert_eq!(writes.timing.hold_until, Some(wall.now() + QUIET_HOLD));
+}
+
+#[test]
+fn decoder_catchup_keeps_the_theme_and_both_favicon_rules() {
+    let (mut p, audio, _) = player(&["a"]);
+    p.offset = 0.0;
+    p.favicon_front = Some('a');
+    p.favicon_allow = Some(vec![
+        "glowtube-clip-a-test-1.svg".into(),
+        "glowtube-clip-b-test-2.svg".into(),
+    ]);
+    let (mut writes, wall, renderer, sink) = write_loop(audio.clone());
+    assert!(writes.tick(&mut p).unwrap());
+    let css = sink.writes.lock().unwrap()[0].1.clone();
+    assert!(css.contains("opacity:.01!important"));
+    assert!(css.contains("glowtube-clip-a-\"]{opacity:1!important"));
+    assert!(css.contains(":not([src*=\"glowtube-clip-b-test-2.svg\"])"));
+    renderer.missing.store(true, Ordering::SeqCst);
+    audio.millis.store(250, Ordering::SeqCst);
+    wall.advance(250);
+    assert!(!writes.tick(&mut p).unwrap());
+    assert_eq!(sink.writes.lock().unwrap().len(), 1);
+    assert_eq!(sink.writes.lock().unwrap()[0].1, css);
+    assert!(writes.quiet_granted_at().is_none());
+    // Python can grant a tagged retry of an already quiet, unchanged theme.
+    writes.request_quiet();
+    wall.advance(250);
+    assert!(!writes.tick(&mut p).unwrap());
+    assert!(writes.quiet_granted_at().is_some());
+    assert_eq!(sink.writes.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn jump_counter_tracks_seeks_and_track_changes_but_not_loads_or_pause() {
+    let (mut p, audio, _) = player(&["a,b,c"]);
+    let initial = p.jumps;
+    assert_eq!(initial, 1);
+    p.poll().unwrap();
+    p.set_playing(false).unwrap();
+    p.set_playing(true).unwrap();
+    assert_eq!(p.jumps, initial);
+    p.seek(1.0).unwrap();
+    p.seek_to(0.5).unwrap();
+    assert_eq!(p.jumps, initial + 2);
+    p.jump(1).unwrap();
+    eventually(|| {
+        p.poll().unwrap();
+        p.ready().is_some()
+    });
+    assert_eq!(p.jumps, initial + 3);
+    p.play_next(1).unwrap();
+    assert_eq!(p.jumps, initial + 3);
+    audio.ended.store(true, Ordering::SeqCst);
+    p.poll().unwrap();
+    assert_eq!(p.jumps, initial + 4);
+    p.favicon_front = Some('b');
+    assert_eq!(p.status().front.as_deref(), Some("b"));
+}
+
+#[test]
+fn scheduler_bridge_receives_jump_counter_and_landed_quiet_time_and_sets_front() {
+    use crate::favicon::{FaviconDriver, FaviconEffects, Scheduler};
+    use dt_t3::favicon::*;
+    type Snapshots = Arc<Mutex<Vec<(u64, Option<Instant>)>>>;
+    struct Capture {
+        snapshots: Snapshots,
+    }
+    impl Scheduler for Capture {
+        fn tick(&mut self, input: FaviconTick<'_>, jumps: u64) -> Result<Vec<FaviconAction>> {
+            self.snapshots
+                .lock()
+                .unwrap()
+                .push((jumps, input.quiet_granted_at));
+            Ok(vec![
+                FaviconAction::SetFront(Some(Deck::B)),
+                FaviconAction::SetLive(true),
+            ])
+        }
+        fn stop(&mut self) -> Vec<FaviconAction> {
+            vec![]
+        }
+    }
+    struct NoEffects;
+    impl FaviconEffects for NoEffects {
+        fn encode(&self, _: ClipJob) -> Result<ReadyClip> {
+            panic!("unexpected encode")
+        }
+        fn publish(&self, _: &str, _: &std::path::Path) -> Result<()> {
+            panic!("unexpected publish")
+        }
+        fn blank(&self, _: &str, _: &std::path::Path) -> Result<()> {
+            panic!("unexpected blank")
+        }
+        fn cleanup(&self, _: &std::path::Path, _: usize) -> Result<()> {
+            panic!("unexpected cleanup")
+        }
+    }
+    let (mut p, audio, _) = player(&["a"]);
+    p.offset = 0.0;
+    let (mut writes, wall, _, _) = write_loop(audio);
+    writes.request_quiet();
+    writes.tick(&mut p).unwrap();
+    let landed = wall.now();
+    let snapshots = Arc::new(Mutex::new(vec![]));
+    let mut driver = FaviconDriver::new(
+        Box::new(Capture {
+            snapshots: snapshots.clone(),
+        }),
+        Arc::new(NoEffects),
+    )
+    .unwrap();
+    driver.tick(&mut p, &mut writes, wall.now()).unwrap();
+    assert_eq!(snapshots.lock().unwrap()[0], (p.jumps, Some(landed)));
+    assert_eq!(p.favicon_front, Some('b'));
+    assert!(p.favicon_live);
+    p.seek(0.0).unwrap();
+    writes.synchronize(&p).unwrap();
+    driver.tick(&mut p, &mut writes, wall.now()).unwrap();
+    assert_eq!(snapshots.lock().unwrap()[1], (p.jumps, None));
+    driver.stop().unwrap();
+}
+
+#[test]
+fn real_theme_writer_persists_the_complete_orchestrated_theme_in_a_temp_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let themes = temp.path().join("themes");
+    let (mut p, audio, _) = player(&["a"]);
+    p.offset = 0.0;
+    p.favicon_front = Some('b');
+    p.favicon_allow = Some(vec!["glowtube-clip-b-test-1.svg".into()]);
+    let wall = FakeWall::new();
+    let mut writes = WriteLoop::with_dependencies(
+        audio,
+        Arc::new(wall),
+        WriteTiming::default(),
+        Box::new(FakeRenderer(Arc::new(RenderState::default()))),
+        Box::new(dt_t3::theme::ThemeWriter {
+            themes_dir: themes.clone(),
+        }),
+        AheadPool::with_encoder(1, Arc::new(FakeEncoder)).unwrap(),
+    )
+    .unwrap();
+    assert!(writes.tick(&mut p).unwrap());
+    let files: Vec<_> = std::fs::read_dir(&themes).unwrap().collect();
+    assert_eq!(files.len(), 1);
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(files[0].as_ref().unwrap().path()).unwrap()).unwrap();
+    let css = value["css"].as_str().unwrap();
+    assert!(css.contains("opacity:.01!important"));
+    assert!(css.contains(":not([src*=\"glowtube-clip-b-test-1.svg\"])"));
+    assert!(!css.contains("--idle"));
+    writes.stop().unwrap();
+}
+
+#[test]
+fn native_favicon_effects_use_explicit_projects_and_owned_paths_against_a_mock_api() {
+    use crate::favicon::{FaviconEffects, NativeEffects};
+    use std::io::{BufRead, Read, Write};
+    let temp = tempfile::tempdir().unwrap();
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let mock = thread::spawn(move || {
+        let mut requests = vec![];
+        for _ in 0..2 {
+            let mut connection = None;
+            eventually(|| match listener.accept() {
+                Ok((stream, _)) => {
+                    connection = Some(stream);
+                    true
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+                Err(error) => panic!("mock accept failed: {error}"),
+            });
+            let mut stream = connection.unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut reader = std::io::BufReader::new(&stream);
+            let mut first = String::new();
+            reader.read_line(&mut first).unwrap();
+            assert_eq!(first.trim(), "POST /api/projects/mutate HTTP/1.1");
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            assert!(length > 0 && length < 10000);
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            requests.push(serde_json::from_slice::<serde_json::Value>(&body).unwrap());
+            drop(reader);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .unwrap();
+        }
+        requests
+    });
+    let paths = dt_t3::T3Paths {
+        home: temp.path().into(),
+        runtime_file: temp.path().join("runtime.json"),
+        token_file: temp.path().join("fake-token"),
+        themes_dir: temp.path().join("themes"),
+        settings_file: temp.path().join("settings.json"),
+        cli: temp.path().join("unused-t3"),
+    };
+    std::fs::write(
+        &paths.runtime_file,
+        serde_json::to_vec(&serde_json::json!({"origin": origin, "pid": 123})).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(&paths.token_file, "fake-test-token").unwrap();
+    let effects = NativeEffects {
+        encoder: dt_render::encode::FfmpegAvifEncoder {
+            ffmpeg: "unused-ffmpeg".into(),
+            work_dir: temp.path().join("encode"),
+        },
+        api: dt_t3::api::T3Api::new(paths).unwrap(),
+        clips_dir: temp.path().join("clips"),
+    };
+    let clip = effects.clips_dir.join("glowtube-clip-b-test.svg");
+    effects.publish("project-b", &clip).unwrap();
+    let blank = effects.clips_dir.join("glowtube-blank.svg");
+    effects.blank("project-a", &blank).unwrap();
+    let requests = mock.join().unwrap();
+    assert_eq!(requests[0]["projectId"], "project-b");
+    assert_eq!(requests[0]["faviconPath"], clip.to_string_lossy().as_ref());
+    assert_eq!(requests[1]["projectId"], "project-a");
+    assert_eq!(requests[1]["faviconPath"], blank.to_string_lossy().as_ref());
+    assert_eq!(
+        std::fs::read_to_string(&blank).unwrap(),
+        dt_t3::favicon::BLANK_SVG
+    );
+    assert!(
+        effects
+            .blank("project-a", &temp.path().join("foreign.svg"))
+            .is_err()
+    );
+    assert!(effects.cleanup(temp.path(), 0).is_err());
 }
 
 #[test]

@@ -82,6 +82,8 @@ pub struct Player {
     pub index: usize,
     /// Playback enabled, including while the source is loading.
     pub playing: bool,
+    /// Music is held at its current position while the first favicon clip loads.
+    pub held: bool,
     /// Main-loop lifetime flag.
     pub running: bool,
     /// Clamped gain.
@@ -98,10 +100,14 @@ pub struct Player {
     pub favicon_live: bool,
     /// Front deck, supplied by the favicon adapter.
     pub favicon_front: Option<char>,
+    /// Basenames allowed to show; None leaves filtering unchanged, empty hides every clip.
+    pub favicon_allow: Option<Vec<String>>,
     /// Manual wall-time hold from ctl holdwrites.
     pub hold_until: Option<Instant>,
     /// Increments on seek/source/pause changes to invalidate rendering work.
     pub revision: u64,
+    /// Counts only seeks and selected-track changes, including EOF and initial selection.
+    pub jumps: u64,
     /// Commands request an early batch, subject to MIN_GAP and quiet holds.
     pub dirty: bool,
     message: String,
@@ -146,6 +152,7 @@ impl Player {
             serial: 0,
             index: 0,
             playing: true,
+            held: false,
             running: true,
             volume,
             chaos: 11.0,
@@ -154,8 +161,10 @@ impl Player {
             favicon_enabled: true,
             favicon_live: false,
             favicon_front: None,
+            favicon_allow: None,
             hold_until: None,
             revision: 0,
+            jumps: 0,
             dirty: true,
             message: String::new(),
             message_until: None,
@@ -250,8 +259,12 @@ impl Player {
         let was_empty = self.queue.is_empty();
         self.queue.splice(at..at, entries);
         self.ids.splice(at..at, ids);
+        if was_empty && count > 0 {
+            self.jumps += 1;
+        }
         if count > 0 && !was_empty && matches!(mode, AddMode::Now) {
             self.index = at;
+            self.jumps += 1;
             self.set_playing(true)?;
             self.source_changed()?;
         }
@@ -300,7 +313,7 @@ impl Player {
             .track()
             .is_some_and(|t| matches!(t.state, LoadState::Failed));
         let ended = self.source_id.is_some() && self.output(|a| Ok(a.ended()))?;
-        if (self.playing && ended) || (failed && self.queue.len() > 1) {
+        if (self.playing && !self.held && ended) || (failed && self.queue.len() > 1) {
             self.jump(1)?;
         }
         self.evict();
@@ -357,6 +370,7 @@ impl Player {
     /// Wrap a signed queue delta and reset audio position.
     pub fn jump(&mut self, delta: i32) -> Result<()> {
         if !self.queue.is_empty() {
+            self.jumps += 1;
             self.index =
                 (self.index as i64 + i64::from(delta)).rem_euclid(self.queue.len() as i64) as usize;
             self.source_changed()?;
@@ -404,6 +418,7 @@ impl Player {
         if let Some(track) = self.ready() {
             let last = track.pcm.samples.len().saturating_sub(1) as f64 / f64::from(SAMPLE_RATE);
             self.output(|audio| audio.seek(Duration::from_secs_f64(seconds.clamp(0.0, last))))?;
+            self.jumps += 1;
             self.invalidate();
         }
         Ok(())
@@ -480,6 +495,8 @@ impl Player {
             chaos: self.chaos,
             offset: (self.offset * 1000.0).round_ties_even() / 1000.0,
             quality: self.quality.clone(),
+            held: self.held,
+            front: self.favicon_front.map(|front| front.to_string()),
         }
     }
     /// Stop output and join workers; attempt all cleanup even after one failure.

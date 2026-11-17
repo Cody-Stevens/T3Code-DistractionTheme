@@ -39,6 +39,12 @@ pub struct ControlStatus {
     pub offset: f64,
     /// Current encoder quality description, or starting.
     pub quality: String,
+    /// Audio is held for first-clip loading, independently of the user's playing flag.
+    #[serde(default)]
+    pub held: bool,
+    /// Front favicon deck (a/b), or null when theme video is visible.
+    #[serde(default)]
+    pub front: Option<String>,
 }
 
 /// Working blocking client for Python's unauthenticated 127.0.0.1 control API.

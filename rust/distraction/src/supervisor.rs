@@ -41,7 +41,7 @@ pub fn start_player(executable: &Path, state_dir: &Path) -> Result<Child> {
 }
 /// Injectable owned-child shutdown transport and clock.
 pub trait ChildShutdown {
-    /// Reap an exited child, returning true when no fallback kill is needed.
+    /// Reap an exited child; its owned descendants still need cleanup.
     fn exited(&mut self) -> Result<bool>;
     /// Attempt ctl quit with the given timeout; do not target unrelated helpers.
     fn quit(&mut self, timeout: Duration) -> bool;
@@ -52,16 +52,16 @@ pub trait ChildShutdown {
     /// Kill and reap the whole owned process tree.
     fn kill_tree(&mut self) -> Result<()>;
 }
-/// Graceful quit (3 s request), up to 10 s exit wait, then whole-tree kill/reap.
+/// Graceful quit (3 s request), up to 10 s exit wait, then release the whole owned tree.
 pub fn stop_owned_child(child: &mut dyn ChildShutdown) -> Result<()> {
     if child.exited()? {
-        return Ok(());
+        return child.kill_tree();
     }
     if child.quit(Duration::from_secs(3)) {
         let deadline = child.now() + Duration::from_secs(10);
         loop {
             if child.exited()? {
-                return Ok(());
+                break;
             }
             let remaining = deadline.saturating_sub(child.now());
             if remaining.is_zero() {
@@ -228,6 +228,7 @@ impl SupervisorHost for NativeHost {
             .flatten()
             .is_some()
         {
+            dt_platform::process::kill_process_tree(self.child.as_mut().expect("owned child"))?;
             self.child.take();
             return Ok(true);
         }
@@ -254,7 +255,9 @@ impl SupervisorHost for NativeHost {
 }
 /// Hold one service mutex, poll every 3 s, and stop the owned player on shutdown/T3 exit.
 pub fn serve() -> Result<()> {
-    let Some(_instance) = dt_platform::process::single_instance("Local\\GlowTubeService")? else {
+    let Some(_instance) =
+        dt_platform::process::single_instance(dt_platform::process::SERVICE_MUTEX)?
+    else {
         return Ok(());
     };
     let shutdown = crate::runtime::termination_flag()?;

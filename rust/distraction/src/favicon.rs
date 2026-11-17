@@ -1,6 +1,6 @@
 //! Execute favicon scheduler actions on independent encode/API workers.
 use crate::{player::Player, worker::Worker, write_loop::WriteLoop};
-use dt_core::{Error, Result, constants::FAVICON_KEEP};
+use dt_core::{Error, Result};
 use dt_t3::favicon::*;
 use std::{
     path::{Path, PathBuf},
@@ -8,18 +8,19 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 /// Injectable scheduler boundary, including fake late quiet requests.
 pub trait Scheduler {
     /// Advance from a snapshot and completed effects.
-    fn tick(&mut self, input: FaviconTick<'_>) -> Result<Vec<FaviconAction>>;
+    fn tick(&mut self, input: FaviconTick<'_>, jumps: u64) -> Result<Vec<FaviconAction>>;
     /// Request final cancellation/blanking.
     fn stop(&mut self) -> Vec<FaviconAction>;
 }
 impl Scheduler for FaviconScheduler {
-    fn tick(&mut self, input: FaviconTick<'_>) -> Result<Vec<FaviconAction>> {
+    fn tick(&mut self, input: FaviconTick<'_>, _jumps: u64) -> Result<Vec<FaviconAction>> {
+        // The dt-t3 seek-counter follow-up adds this input to its public snapshot.
         self.tick(input)
     }
     fn stop(&mut self) -> Vec<FaviconAction> {
@@ -31,16 +32,16 @@ pub trait FaviconEffects: Send + Sync {
     /// Encode a clip on its independent worker.
     fn encode(&self, job: ClipJob) -> Result<ReadyClip>;
     /// Publish the selected deck's asset path.
-    fn publish(&self, path: &Path) -> Result<()>;
-    /// Clear both decks with a tiny owned blank SVG.
-    fn blank(&self) -> Result<()>;
-    /// Retain 30 recent owned clip files for late client downloads.
-    fn cleanup(&self) -> Result<()>;
+    fn publish(&self, project_id: &str, path: &Path) -> Result<()>;
+    /// Clear the selected deck with a tiny owned blank SVG.
+    fn blank(&self, project_id: &str, path: &Path) -> Result<()>;
+    /// Retain the requested number of owned clip files for late client downloads.
+    fn cleanup(&self, clips_dir: &Path, keep: usize) -> Result<()>;
 }
 enum ApiJob {
-    Publish(PathBuf, Instant),
-    Blank,
-    Cleanup,
+    Publish(String, PathBuf, Instant),
+    Blank(String, PathBuf),
+    Cleanup(PathBuf, usize),
 }
 type EncodeAnswer = (u64, Option<FaviconEvent>);
 type ApiAnswer = (u64, Option<FaviconEvent>);
@@ -51,7 +52,6 @@ pub struct FaviconDriver {
     encode: Worker<(u64, ClipJob), EncodeAnswer>,
     api: Worker<(u64, ApiJob), ApiAnswer>,
     generation: Arc<AtomicU64>,
-    front: Option<(char, Instant)>,
     deferred: Vec<FaviconEvent>,
     stopped: bool,
 }
@@ -78,19 +78,20 @@ impl FaviconDriver {
                 return (generation, None);
             }
             let event = match job {
-                ApiJob::Publish(path, deadline) => Some(
-                    if Instant::now() < deadline && api_effects.publish(&path).is_ok() {
+                ApiJob::Publish(project_id, path, deadline) => Some(
+                    if Instant::now() < deadline && api_effects.publish(&project_id, &path).is_ok()
+                    {
                         FaviconEvent::Published(path)
                     } else {
                         FaviconEvent::PublishFailed(path)
                     },
                 ),
-                ApiJob::Blank => {
-                    let _ = api_effects.blank();
+                ApiJob::Blank(project_id, path) => {
+                    let _ = api_effects.blank(&project_id, &path);
                     None
                 }
-                ApiJob::Cleanup => {
-                    let _ = api_effects.cleanup();
+                ApiJob::Cleanup(clips_dir, keep) => {
+                    let _ = api_effects.cleanup(&clips_dir, keep);
                     None
                 }
             };
@@ -102,7 +103,6 @@ impl FaviconDriver {
             encode,
             api,
             generation,
-            front: None,
             deferred: vec![],
             stopped: false,
         })
@@ -125,32 +125,21 @@ impl FaviconDriver {
             if epoch == generation
                 && let Some(event) = event
             {
-                if let FaviconEvent::Published(path) = &event {
-                    let name = path.file_name().and_then(|p| p.to_str()).unwrap_or("");
-                    let deck = if name.starts_with("glowtube-clip-b-") {
-                        'b'
-                    } else {
-                        'a'
-                    };
-                    self.front = Some((deck, now + Duration::from_millis(1200)));
-                }
                 events.push(event);
             }
         }
-        if let Some((deck, _)) = self.front.filter(|(_, due)| now >= *due) {
-            player.favicon_front = Some(deck);
-            player.dirty = true;
-            self.front = None;
-        }
-        let actions = self.scheduler.tick(FaviconTick {
-            track: player.ready().map(|t| &t.info),
-            media_time: player.clock().media_time(),
-            wall_time: now,
-            playing: player.playing,
-            enabled: player.favicon_enabled,
-            quiet_granted_at: writes.quiet_granted_at(),
-            events,
-        })?;
+        let actions = self.scheduler.tick(
+            FaviconTick {
+                track: player.ready().map(|t| &t.info),
+                media_time: player.clock().media_time(),
+                wall_time: now,
+                playing: player.playing,
+                enabled: player.favicon_enabled,
+                quiet_granted_at: writes.quiet_written_at(),
+                events,
+            },
+            player.jumps,
+        )?;
         for action in actions {
             let generation = self.generation.load(Ordering::Acquire);
             match action {
@@ -161,11 +150,12 @@ impl FaviconDriver {
                 }
                 FaviconAction::CancelPending => {
                     self.generation.fetch_add(1, Ordering::AcqRel);
-                    self.front = None;
                     self.deferred.clear();
                 }
                 FaviconAction::RequestQuiet => writes.request_quiet(),
-                FaviconAction::Publish(path) => {
+                FaviconAction::Publish {
+                    project_id, path, ..
+                } => {
                     let granted = writes.quiet_granted_at().is_some_and(|grant| now >= grant)
                         && writes.timing.hold_until.is_some_and(|until| now < until)
                         && player.playing
@@ -176,6 +166,7 @@ impl FaviconDriver {
                             .submit((
                                 generation,
                                 ApiJob::Publish(
+                                    project_id,
                                     path.clone(),
                                     writes.timing.hold_until.expect("granted hold"),
                                 ),
@@ -185,8 +176,24 @@ impl FaviconDriver {
                         self.deferred.push(FaviconEvent::PublishFailed(path));
                     }
                 }
-                FaviconAction::Blank => self.api.submit((generation, ApiJob::Blank))?,
-                FaviconAction::Cleanup => self.api.submit((generation, ApiJob::Cleanup))?,
+                FaviconAction::Blank {
+                    project_id, path, ..
+                } => self
+                    .api
+                    .submit((generation, ApiJob::Blank(project_id, path)))?,
+                FaviconAction::Cleanup { clips_dir, keep } => self
+                    .api
+                    .submit((generation, ApiJob::Cleanup(clips_dir, keep)))?,
+                FaviconAction::SetFront(front) => {
+                    let front = front.map(|deck| match deck {
+                        Deck::A => 'a',
+                        Deck::B => 'b',
+                    });
+                    if player.favicon_front != front {
+                        player.favicon_front = front;
+                        player.dirty = true;
+                    }
+                }
                 FaviconAction::SetLive(live) => {
                     if player.favicon_live != live {
                         player.dirty = true;
@@ -194,7 +201,6 @@ impl FaviconDriver {
                     player.favicon_live = live;
                     if !live {
                         player.favicon_front = None;
-                        self.front = None;
                     }
                 }
             }
@@ -207,11 +213,22 @@ impl FaviconDriver {
             return Ok(());
         }
         self.stopped = true;
-        self.scheduler.stop();
+        let actions = self.scheduler.stop();
         self.generation.fetch_add(1, Ordering::AcqRel);
         let encoding = self.encode.stop();
         let api = self.api.stop();
-        let blank = self.effects.blank();
+        let mut blank = Ok(());
+        for action in actions {
+            if let FaviconAction::Blank {
+                project_id, path, ..
+            } = action
+            {
+                let result = self.effects.blank(&project_id, &path);
+                if blank.is_ok() {
+                    blank = result;
+                }
+            }
+        }
         encoding.and(api).and(blank)
     }
 }
@@ -227,10 +244,6 @@ pub struct NativeEffects {
     pub encoder: dt_render::encode::FfmpegAvifEncoder,
     /// Scoped authenticated T3 client (never logged).
     pub api: dt_t3::api::T3Api,
-    /// Front deck project.
-    pub project_a: String,
-    /// Back deck project, if present.
-    pub project_b: Option<String>,
     /// Dedicated local clip directory.
     pub clips_dir: PathBuf,
 }
@@ -250,20 +263,9 @@ impl FaviconEffects for NativeEffects {
             frames: encoded.frames,
         })
     }
-    fn publish(&self, path: &Path) -> Result<()> {
-        let back = path
-            .file_name()
-            .and_then(|p| p.to_str())
-            .is_some_and(|name| name.starts_with("glowtube-clip-b-"));
-        let project = if back {
-            self.project_b
-                .as_deref()
-                .ok_or(Error::Protocol("back deck not configured"))?
-        } else {
-            &self.project_a
-        };
+    fn publish(&self, project_id: &str, path: &Path) -> Result<()> {
         self.api.update_project(
-            project,
+            project_id,
             [(
                 "faviconPath".into(),
                 serde_json::Value::String(path.to_string_lossy().into_owned()),
@@ -272,26 +274,22 @@ impl FaviconEffects for NativeEffects {
         )?;
         Ok(())
     }
-    fn blank(&self) -> Result<()> {
-        std::fs::create_dir_all(&self.clips_dir)?;
-        let blank = self.clips_dir.join("glowtube-blank.svg");
-        std::fs::write(
-            &blank,
-            r#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>"#,
-        )?;
-        for project in std::iter::once(&self.project_a).chain(self.project_b.iter()) {
-            self.api.update_project(
-                project,
-                [(
-                    "faviconPath".into(),
-                    serde_json::Value::String(blank.to_string_lossy().into_owned()),
-                )]
-                .into(),
-            )?;
+    fn blank(&self, project_id: &str, path: &Path) -> Result<()> {
+        if path.parent() != Some(self.clips_dir.as_path())
+            || path
+                .file_name()
+                .is_none_or(|name| name != "glowtube-blank.svg")
+        {
+            return Err(Error::InvalidInput("blank path outside clip directory"));
         }
-        Ok(())
+        std::fs::create_dir_all(&self.clips_dir)?;
+        std::fs::write(path, BLANK_SVG)?;
+        self.publish(project_id, path)
     }
-    fn cleanup(&self) -> Result<()> {
+    fn cleanup(&self, clips_dir: &Path, keep: usize) -> Result<()> {
+        if clips_dir != self.clips_dir {
+            return Err(Error::InvalidInput("cleanup outside clip directory"));
+        }
         if !self.clips_dir.exists() {
             return Ok(());
         }
@@ -308,7 +306,7 @@ impl FaviconEffects for NativeEffects {
             }
         }
         files.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-        for (_, path) in files.into_iter().skip(FAVICON_KEEP) {
+        for (_, path) in files.into_iter().skip(keep) {
             std::fs::remove_file(path)?;
         }
         Ok(())

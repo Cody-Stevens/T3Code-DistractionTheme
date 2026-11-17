@@ -120,7 +120,12 @@ pub fn setup_with_paths(paths: T3Paths) -> Result<()> {
         workspace_root: root,
         idle_theme: idle_document()?,
     };
-    dt_t3::setup::setup(&config, &Permissions)?;
+    let report = dt_t3::setup::setup_decks(&config, &Permissions)?;
+    if report.idle_threads_required {
+        eprintln!(
+            "Both favicon decks need idle sidebar threads; the current T3 session could not create them. See dt-t3 setup guidance."
+        );
+    }
     Ok(())
 }
 fn favicon(paths: T3Paths) -> Result<FaviconDriver> {
@@ -140,6 +145,7 @@ fn favicon(paths: T3Paths) -> Result<FaviconDriver> {
     let config = dt_t3::favicon::FaviconConfig {
         clips_dir: clips_dir.clone(),
         project_id: project.id.clone(),
+        deck_b_project_id: project_b,
         run_id: format!(
             "{}-{}",
             std::process::id(),
@@ -155,8 +161,6 @@ fn favicon(paths: T3Paths) -> Result<FaviconDriver> {
         Arc::new(NativeEffects {
             encoder: encoder()?,
             api,
-            project_a: project.id,
-            project_b,
             clips_dir,
         }),
     )

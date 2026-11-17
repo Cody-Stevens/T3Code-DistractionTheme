@@ -21,5 +21,9 @@ serde_json.workspace = true
 # Request orderly teardown of audio, input watchers, workers and the owned service child on Ctrl-C.
 ctrlc = "3.4"
 
+[dev-dependencies]
+# Own isolated fake runtime, theme and token directories; remove them on test teardown.
+tempfile = "3.27"
+
 [lints]
 workspace = true
