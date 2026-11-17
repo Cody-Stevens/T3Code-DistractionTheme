@@ -340,6 +340,7 @@ class Player:
         self.lock = threading.RLock()
         self.playing = True
         self.pos = 0                      # next sample to hand to the sound card
+        self.jumps = 0                    # counts seeks and track changes (the favicon video restarts on each)
         self.volume = float(os.environ.get("GLOWTUBE_VOLUME", "0.8"))
         self.chaos = 11.0
         self.offset = 0.16                # seconds from writing a theme to it showing on screen
@@ -394,10 +395,12 @@ class Player:
             with self.lock:
                 if not self.queue:
                     self.queue, self.index, self.pos = tracks, 0, 0
+                    self.jumps += 1
                 elif mode in ("now", "next"):
                     self.queue[self.index + 1:self.index + 1] = tracks
                     if mode == "now":
                         self.index, self.pos, self.playing = self.index + 1, 0, True
+                        self.jumps += 1
                 else:
                     self.queue.extend(tracks)
             what = f"{len(tracks)} tracks" if len(tracks) > 1 else (tracks[0].title if tracks else "nothing")
@@ -467,6 +470,7 @@ class Player:
         with self.lock:
             if self.queue:
                 self.index = (self.index + delta) % len(self.queue)
+                self.jumps += 1
                 self.pos = 0
 
     def seek_to(self, fraction: float) -> None:
@@ -474,12 +478,14 @@ class Player:
             t = self.track
             if t and t.pcm is not None:
                 self.pos = int(np.clip(fraction, 0, 1) * (len(t.pcm) - 1))
+                self.jumps += 1
 
     def seek(self, seconds: float) -> None:
         with self.lock:
             t = self.track
             if t and t.pcm is not None:
                 self.pos = int(np.clip(self.pos + seconds * SR, 0, len(t.pcm) - 1))
+                self.jumps += 1
 
     @property
     def gated(self) -> bool:
@@ -497,6 +503,7 @@ class Player:
                 self.cb_pos, self.cb_wall = self.pos, time.perf_counter()
                 if t is not None and t.failed and len(self.queue) > 1:
                     self.index = (self.index + 1) % len(self.queue)
+                    self.jumps += 1
                 return
             chunk = t.pcm[self.pos:self.pos + frames]
             out[: len(chunk)] = (chunk * self.volume).astype(np.int16)
@@ -505,6 +512,7 @@ class Player:
             self.pos += frames
             if self.pos >= len(t.pcm):
                 self.index = (self.index + 1) % len(self.queue)
+                self.jumps += 1
                 self.pos = 0
 
     def media_time(self) -> float:
@@ -828,6 +836,7 @@ class FaviconVideo:
         self.front: Deck | None = None
         self.plan: list[Planned] = []
         self.gate_started = 0.0
+        self.jumps_seen = 0
         self.seq = 0
         self.run_id = time.strftime("%H%M%S")   # clip paths stay unique across restarts
         self.pool = ProcessPoolExecutor(max_workers=1)   # never queued behind the theme's short clips
@@ -837,11 +846,13 @@ class FaviconVideo:
         threading.Thread(target=self._loop, daemon=True).start()
 
     # -- T3
-    def _publish(self, deck: Deck, path: Path) -> None:
+    def _publish(self, deck: Deck, path: Path) -> bool:
         try:
             self.api.update_project(deck.project_id, faviconPath=str(path))
+            return True
         except t3api.T3Error as exc:
             print(f"favicon update failed: {exc}", file=sys.stderr, flush=True)
+            return False
 
     def _drop_plan(self) -> None:
         busy = False
@@ -983,7 +994,10 @@ class FaviconVideo:
             p.gate_release = None
         now = p.media_time()
         front = self.front
-        if front and not (front.clip and front.clip[0] == t.id and front.clip[1] - 0.6 <= now < front.clip[2]):
+        jumped = p.jumps != self.jumps_seen   # a seek inside the current clip's range must restart too
+        self.jumps_seen = p.jumps
+        if (front or self.plan) and jumped or \
+                front and not (front.clip and front.clip[0] == t.id and front.clip[1] - 0.6 <= now < front.clip[2]):
             self._log(f"front clip no longer matches (now {now:.1f}s); starting over")
             self._restart()               # seek, track change, or the clip ran out
             front = None
@@ -1023,7 +1037,9 @@ class FaviconVideo:
                 print(f"clip encode failed: {exc!r}", file=sys.stderr, flush=True)
                 return
             deck = nxt.deck
-            self._publish(deck, Path(path))
+            if not self._publish(deck, Path(path)):
+                self._allow()             # the deck keeps its old clip; the plan carries on from there
+                return
             if p.gate_release == math.inf:   # the clip shows ~SHOW_LATENCY from now: start the music with it
                 p.gate_release = time.monotonic() + max(0.0, SHOW_LATENCY - p.stream.latency)
             deck.clip, deck.blank, deck.published_at = (nxt.track, nxt.start, nxt.start + frames / FPS), False, time.monotonic()
