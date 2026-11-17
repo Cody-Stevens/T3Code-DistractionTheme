@@ -1,7 +1,10 @@
 //! Now Playing image from `card_image.py`. Marker RGB values live in dt-core for the input reader.
 
 use dt_core::{Frame, Result};
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex, OnceLock},
+};
 
 /// Port `card_image.QueueItem.state`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -60,14 +63,33 @@ use dt_core::{
 use fontdue::{Font, FontSettings};
 use image::{Rgb, RgbImage};
 const BG: [u8; 3] = [17, 10, 29];
-struct Face(Option<Font>);
+struct Face(Option<Arc<Font>>);
 impl Face {
     fn load(path: &std::path::Path) -> Self {
-        Self(
-            std::fs::read(path)
-                .ok()
-                .and_then(|b| Font::from_bytes(b, FontSettings::default()).ok()),
-        )
+        // Card subtitles change every write; keep parsed faces across those renders.
+        type Fonts = Vec<(PathBuf, Arc<Font>)>;
+        static FONTS: OnceLock<Mutex<Fonts>> = OnceLock::new();
+        let cache = FONTS.get_or_init(|| Mutex::new(Vec::new()));
+        if let Some((_, font)) = cache
+            .lock()
+            .expect("font cache")
+            .iter()
+            .find(|(p, _)| p == path)
+        {
+            return Self(Some(font.clone()));
+        }
+        let font = std::fs::read(path)
+            .ok()
+            .and_then(|b| Font::from_bytes(b, FontSettings::default()).ok())
+            .map(Arc::new);
+        if let Some(font) = &font {
+            let mut cache = cache.lock().expect("font cache");
+            if cache.len() >= 4 {
+                cache.remove(0);
+            }
+            cache.push((path.to_owned(), font.clone()));
+        }
+        Self(font)
     }
     fn width(&self, text: &str, size: f32) -> f32 {
         match &self.0 {
@@ -402,7 +424,9 @@ pub fn encode(frame: &Frame) -> Result<String> {
             webp::WebPConfig::new().map_err(|_| Error::Protocol("WebP configuration failed"))?;
         config.lossless = 1;
         config.quality = 100.0;
-        config.method = 6;
+        // Method 6 took ~450 ms per changing card; method 3 takes ~12 ms and remains
+        // lossless. The same palette/size checks below still enforce the card budget.
+        config.method = 3;
         let encoded = webp::Encoder::from_rgb(&pixels, frame.width(), frame.height())
             .encode_advanced(&config)
             .map_err(|_| Error::Protocol("lossless WebP encode failed"))?;

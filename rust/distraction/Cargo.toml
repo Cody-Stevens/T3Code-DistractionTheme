@@ -18,8 +18,12 @@ reqwest.workspace = true
 # Same JSON wire format as glowtube.serve; no bearer token needed on the helper's loopback API.
 serde.workspace = true
 serde_json.workspace = true
-# Planned blocking loopback server. Bind only 127.0.0.1; never use a wildcard listener.
-tiny_http = "0.12"
+# Request orderly teardown of audio, input watchers, workers and the owned service child on Ctrl-C.
+ctrlc = "3.4"
+
+[dev-dependencies]
+# Own isolated fake runtime, theme and token directories; remove them on test teardown.
+tempfile = "3.27"
 
 [lints]
 workspace = true

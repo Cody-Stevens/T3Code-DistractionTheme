@@ -24,6 +24,7 @@ fn config() -> FaviconConfig {
         deck_b_project_id: Some("project-b".into()),
         run_id: "fake-run".into(),
         show_latency: seconds(0.5),
+        first_show_latency: None,
         first_clip: seconds(10.0),
         clip_seconds: seconds(22.0),
         gate: true,
@@ -388,6 +389,31 @@ fn start_and_steady_playback_cover_every_audible_interval() {
 }
 
 #[test]
+fn seek_cancels_an_unacknowledged_quiet_request_before_replanning() {
+    let track = track(241);
+    let mut sim = Simulation::new();
+    sim.grant_quiet = false;
+    while sim.requests.is_empty() {
+        assert!(sim.wall < 5.0);
+        sim.step(Some(&track));
+        sim.advance();
+    }
+    assert!(sim.publishes.is_empty());
+    // The write owner rejects the old request on a seek and cannot acknowledge it.
+    sim.seek(40.0);
+    sim.grant_quiet = true;
+    sim.grant = None;
+    sim.grant_due = None;
+    sim.step(Some(&track));
+    sim.run_until(&track, 50.0);
+    assert!(sim.requests.len() >= 2);
+    assert_eq!(sim.publishes[0].media, 40.0);
+    assert_eq!(sim.holds, 2);
+    assert_eq!(sim.blanks, 0);
+    sim.assert_covered();
+}
+
+#[test]
 fn in_range_seek_and_track_change_restart_without_blank_publications() {
     let track = track(400);
     let mut sim = Simulation::new();
@@ -736,77 +762,115 @@ fn missing_hold_ack_releases_at_deadline_without_immediately_holding_again() {
 }
 
 #[test]
-fn publish_requires_ack_and_output_latency_is_subtracted_from_release() {
+fn delayed_publish_ack_uses_completion_time_and_subtracts_output_latency() {
     for latency in [0.0, 0.1, 0.8] {
-        let track = track(100);
-        let mut scheduler = FaviconScheduler::new(config());
-        let wall = Instant::now();
-        let actions = scheduler.tick(snapshot(&track, wall, 0.0, vec![])).unwrap();
-        let FaviconAction::HoldAudio { request_id, .. } = actions[0] else {
-            panic!("expected hold");
-        };
-        let actions = scheduler
-            .tick(snapshot(
+        for first_latency in [None, Some(seconds(0.3))] {
+            let track = track(100);
+            let mut config = config();
+            config.first_show_latency = first_latency;
+            let mut scheduler = FaviconScheduler::new(config);
+            let wall = Instant::now();
+            let actions = scheduler.tick(snapshot(&track, wall, 0.0, vec![])).unwrap();
+            let FaviconAction::HoldAudio { request_id, .. } = actions[0] else {
+                panic!("expected hold");
+            };
+            let actions = scheduler
+                .tick(snapshot(
+                    &track,
+                    wall,
+                    0.0,
+                    vec![FaviconEvent::AudioHeld {
+                        request_id,
+                        media_time: Duration::ZERO,
+                    }],
+                ))
+                .unwrap();
+            let job = actions
+                .into_iter()
+                .find_map(|a| {
+                    if let FaviconAction::Encode(job) = a {
+                        Some(job)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            let ready = ReadyClip {
+                job: job.clone(),
+                frames: 240,
+            };
+            scheduler
+                .tick(snapshot(
+                    &track,
+                    wall + seconds(2.0),
+                    0.0,
+                    vec![FaviconEvent::Encoded(ready)],
+                ))
+                .unwrap();
+            let mut input = snapshot(&track, wall + seconds(3.1), 0.0, vec![]);
+            input.quiet_granted_at = Some(wall + seconds(2.6));
+            let actions = scheduler.tick(input).unwrap();
+            assert!(
+                actions.iter().any(
+                    |a| matches!(a, FaviconAction::Publish { path, .. } if *path == job.output)
+                )
+            );
+            assert!(scheduler.front().is_none());
+            assert!(!actions.iter().any(|a| matches!(
+                a,
+                FaviconAction::SetLive(true) | FaviconAction::ReleaseAudio { .. }
+            )));
+            let mut input = snapshot(
                 &track,
-                wall,
+                wall + seconds(3.8),
                 0.0,
-                vec![FaviconEvent::AudioHeld {
-                    request_id,
-                    media_time: Duration::ZERO,
+                vec![FaviconEvent::PublishedAt {
+                    path: job.output,
+                    wall_time: wall + seconds(3.2),
                 }],
-            ))
-            .unwrap();
-        let job = actions
-            .into_iter()
-            .find_map(|a| {
-                if let FaviconAction::Encode(job) = a {
-                    Some(job)
-                } else {
-                    None
-                }
-            })
-            .unwrap();
-        let ready = ReadyClip {
-            job: job.clone(),
-            frames: 240,
-        };
-        scheduler
-            .tick(snapshot(
-                &track,
-                wall + seconds(2.0),
-                0.0,
-                vec![FaviconEvent::Encoded(ready)],
-            ))
-            .unwrap();
-        let mut input = snapshot(&track, wall + seconds(3.1), 0.0, vec![]);
-        input.quiet_granted_at = Some(wall + seconds(2.6));
-        let actions = scheduler.tick(input).unwrap();
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, FaviconAction::Publish { path, .. } if *path == job.output))
-        );
-        assert!(scheduler.front().is_none());
-        assert!(!actions.iter().any(|a| matches!(
-            a,
-            FaviconAction::SetLive(true) | FaviconAction::ReleaseAudio { .. }
-        )));
-        let mut input = snapshot(
-            &track,
-            wall + seconds(3.2),
-            0.0,
-            vec![FaviconEvent::Published(job.output)],
-        );
-        input.output_latency = seconds(latency);
-        let actions = scheduler.tick(input).unwrap();
-        let expected = wall + seconds(3.2) + seconds(0.5).saturating_sub(seconds(latency));
-        assert!(
-            actions.iter().any(
+            );
+            input.output_latency = seconds(latency);
+            let actions = scheduler.tick(input).unwrap();
+            let expected = wall
+                + seconds(3.2)
+                + first_latency
+                    .unwrap_or(seconds(0.5))
+                    .saturating_sub(seconds(latency));
+            assert!(actions.iter().any(
                 |a| matches!(a, FaviconAction::ReleaseAudio { at: Some(at) } if *at == expected)
-            )
-        );
-        assert_eq!(scheduler.front(), Some(Deck::A));
+            ));
+            assert_eq!(scheduler.front(), Some(Deck::A));
+        }
     }
+}
+
+#[test]
+fn newest_deck_plan_overlaps_and_reaches_the_track_end() {
+    let track = track(241);
+    let mut sim = Simulation::new();
+    sim.run_until(&track, 240.8);
+    assert!(sim.scheduler.front_clip().unwrap().end() >= seconds(241.0));
+    for pair in sim.jobs.windows(2) {
+        assert_ne!(pair[0].deck, pair[1].deck);
+        let overlap =
+            (pair[0].start + pair[0].duration).as_secs_f64() - pair[1].start.as_secs_f64();
+        assert!((overlap - 3.0).abs() < 0.05, "handover {overlap}");
+    }
+    sim.media = 241.03; // The PCM tail extends beyond the final complete video frame.
+    let actions = sim.step(Some(&track));
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, FaviconAction::HoldAudio { .. }))
+    );
+    assert!(sim.scheduler.front().is_some());
+    sim.seek(0.0);
+    let actions = sim.step(Some(&track));
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, FaviconAction::HoldAudio { .. }))
+    );
 }
 
 #[test]

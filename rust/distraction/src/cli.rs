@@ -3,7 +3,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use dt_core::constants::CONTROL_PORT;
 
-/// Distraction theme helper; only ctl is implemented in the skeleton.
+/// Distraction theme helper.
 #[derive(Debug, Parser)]
 #[command(version, about)]
 pub struct Cli {
@@ -12,10 +12,10 @@ pub struct Cli {
     pub command: Command,
 }
 
-/// Top-level operations. Playback/setup/service/idle are phase-two placeholders.
+/// Top-level operations.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Play URLs or local files (not implemented).
+    /// Play URLs or local files.
     Play {
         /// Initial playlist; an empty list starts with the idle card.
         urls: Vec<String>,
@@ -32,12 +32,15 @@ pub enum Command {
         #[arg(long, env = "GLOWTUBE_PORT", default_value_t = CONTROL_PORT)]
         port: u16,
     },
-    /// Prepare scoped token, project and selected theme (not implemented).
+    /// Prepare scoped token, project and selected theme.
     Setup,
-    /// Supervise playback while T3 is running (not implemented).
+    /// Supervise playback while T3 is running.
     Service,
-    /// Write the idle theme (not implemented).
+    /// Write the idle theme.
     Idle,
+    /// Private warmed codec process; receives bounded JSON jobs on stdin, never T3 commands.
+    #[command(hide = true)]
+    InternalEncodeFavicon,
 }
 
 /// Every command accepted by `glowtube.command`, with unchanged URL path spellings.

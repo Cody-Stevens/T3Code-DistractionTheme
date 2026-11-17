@@ -94,6 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &NativeAvifEncoder,
             &mut state,
             DynamicInput {
+                extra_css: "",
                 frames: &frames,
                 glows: &glows,
                 values: &values,
