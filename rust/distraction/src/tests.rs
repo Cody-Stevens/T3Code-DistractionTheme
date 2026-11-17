@@ -574,7 +574,8 @@ fn ordinary_paused_and_initial_empty_batches_do_not_open_a_window() {
 #[test]
 fn seek_resets_grid_and_cheap_mode_and_css_cap_are_enforced() {
     let (mut p, audio, _) = player(&["a"]);
-    p.offset = 0.0;
+    // Cancel the covered glow lead so frame numbers stay round.
+    p.offset = -crate::write_loop::COVERED_GLOW_LEAD;
     let (mut writes, wall, renderer, sink) = write_loop(audio.clone());
     p.favicon_live = true;
     assert!(writes.tick(&mut p).unwrap());
@@ -1117,9 +1118,26 @@ fn child_shutdown_requests_quit_then_waits_then_kills_whole_tree() {
 }
 
 #[test]
+fn covered_glow_follows_a_late_clip() {
+    let (mut p, _audio, _) = player(&["a"]);
+    p.offset = 0.16;
+    assert!((crate::write_loop::glow_offset(&p) - 0.16).abs() < 1e-9);
+    p.favicon_live = true;
+    let lead = crate::write_loop::COVERED_GLOW_LEAD;
+    assert!((crate::write_loop::glow_offset(&p) - (0.16 + lead)).abs() < 1e-9);
+    // A clip published 0.4 s late shows 0.4 s behind the music; the glow follows it.
+    p.favicon_lag = 0.4;
+    assert!((crate::write_loop::glow_offset(&p) - (0.16 + lead - 0.4)).abs() < 1e-9);
+    // Implausible lags are clamped.
+    p.favicon_lag = 9.0;
+    assert!((crate::write_loop::glow_offset(&p) - (0.16 + lead - 1.5)).abs() < 1e-9);
+}
+
+#[test]
 fn covered_batches_use_one_video_frame_and_sixty_glow_and_value_frames() {
     let (mut p, audio, _) = player(&["a"]);
-    p.offset = 0.0;
+    // Cancel the covered glow lead so frame numbers stay round.
+    p.offset = -crate::write_loop::COVERED_GLOW_LEAD;
     p.favicon_live = true;
     let (mut writes, wall, renderer, _) = write_loop(audio.clone());
     assert!(writes.tick(&mut p).unwrap());

@@ -18,10 +18,17 @@ pub trait Scheduler: Send {
     fn tick(&mut self, input: FaviconTick<'_>) -> Result<Vec<FaviconAction>>;
     /// Request final cancellation/blanking.
     fn stop(&mut self) -> Vec<FaviconAction>;
+    /// Expected lag of the front clip's picture behind the music, in seconds.
+    fn front_lag(&self) -> f64 {
+        0.0
+    }
 }
 impl Scheduler for FaviconScheduler {
     fn tick(&mut self, input: FaviconTick<'_>) -> Result<Vec<FaviconAction>> {
         self.tick(input)
+    }
+    fn front_lag(&self) -> f64 {
+        FaviconScheduler::front_lag(self)
     }
     fn stop(&mut self) -> Vec<FaviconAction> {
         self.stop()
@@ -396,11 +403,13 @@ impl FaviconDriver {
                     .api
                     .submit((generation, ApiJob::Cleanup(clips_dir, keep)))?,
                 FaviconAction::SetFront(front) => {
+                    let lag = self.scheduler.front_lag();
                     crate::diagnostics::log(format_args!(
-                        "front flip deck={} audio={:.3}",
+                        "front flip deck={} audio={:.3} lag={lag:.3}",
                         front.map(Deck::name).unwrap_or("none"),
                         host.clock().media_time().as_secs_f64()
                     ));
+                    host.set_lag(lag);
                     let front = front.map(|deck| match deck {
                         Deck::A => 'a',
                         Deck::B => 'b',

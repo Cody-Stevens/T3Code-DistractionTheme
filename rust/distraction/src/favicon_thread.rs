@@ -45,6 +45,7 @@ pub(crate) trait Host {
     fn hold_until(&self) -> Option<Instant>;
     fn request_quiet(&mut self);
     fn set_front(&mut self, front: Option<char>);
+    fn set_lag(&mut self, lag: f64);
     fn set_allowed(&mut self, files: Vec<String>);
     fn set_live(&mut self, live: bool);
 }
@@ -77,6 +78,9 @@ impl Host for OwnerHost<'_> {
     fn set_front(&mut self, front: Option<char>) {
         apply(self.player, Presentation::Front(front));
     }
+    fn set_lag(&mut self, lag: f64) {
+        apply(self.player, Presentation::Lag(lag));
+    }
     fn set_allowed(&mut self, files: Vec<String>) {
         apply(self.player, Presentation::Allowed(files));
     }
@@ -86,6 +90,7 @@ impl Host for OwnerHost<'_> {
 }
 enum Presentation {
     Front(Option<char>),
+    Lag(f64),
     Allowed(Vec<String>),
     Live(bool),
     Wake,
@@ -95,6 +100,9 @@ fn apply(p: &mut Player, change: Presentation) {
         Presentation::Front(front) => {
             p.favicon_front = front;
         }
+        Presentation::Lag(lag) => {
+            p.favicon_lag = lag;
+        }
         Presentation::Allowed(files) => {
             p.favicon_allow = Some(files);
         }
@@ -102,6 +110,7 @@ fn apply(p: &mut Player, change: Presentation) {
             p.favicon_live = live;
             if !live {
                 p.favicon_front = None;
+                p.favicon_lag = 0.0;
             }
         }
         Presentation::Wake => (),
@@ -162,6 +171,9 @@ impl Host for ThreadHost {
     }
     fn set_front(&mut self, front: Option<char>) {
         self.send(Presentation::Front(front));
+    }
+    fn set_lag(&mut self, lag: f64) {
+        self.send(Presentation::Lag(lag));
     }
     fn set_allowed(&mut self, files: Vec<String>) {
         self.send(Presentation::Allowed(files));
