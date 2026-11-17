@@ -1,0 +1,1 @@
+body:has(img.hidden[src*="glowtube-clip-a-"])::before{content:"";position:fixed;left:0;top:0;width:24px;height:24px;background:#00ff00;z-index:2147483647}body:has(img.hidden[src*="glowtube-clip-b-"])::after{content:"";position:fixed;left:24px;top:0;width:24px;height:24px;background:#0000ff;z-index:2147483647}

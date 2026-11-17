@@ -205,3 +205,126 @@ fn size_search_probes_fast_then_encodes_ahead() {
     assert!(encode_video(&encoder, &frames(8), usize::MAX).is_err());
     assert!(encode_to_fit(&encoder, &[], 1000, 42).is_err());
 }
+
+#[test]
+fn covered_write_animates_values_and_glow_over_one_still() {
+    struct CountEncoder(Mutex<Vec<usize>>);
+    impl AvifEncoder for CountEncoder {
+        fn encode(&self, frames: &[Arc<Frame>], _: &AvifOptions) -> Result<Vec<u8>> {
+            self.0.lock().unwrap().push(frames.len());
+            Ok(vec![42; 300])
+        }
+    }
+    let encoder = CountEncoder(Mutex::new(vec![]));
+    let video = frames(2);
+    let glows = frames(60);
+    let values = vec![BTreeMap::from([("bs".into(), "0.3".into())]); 60];
+    let card = Card {
+        image: "YWJj".into(),
+        height: 285,
+    };
+    let mut state = DynamicState::default();
+    let input = || DynamicInput {
+        frames: &video[..1],
+        glows: &glows,
+        values: &values,
+        card: &card,
+        playing: true,
+        chaos: 11.0,
+        prepared: None,
+        cheap: true,
+    };
+    let built = css::build_dynamic(&encoder, &mut state, input()).unwrap();
+    assert!(built.css.contains("animation:d1 2.500s linear forwards"));
+    assert!(built.css.contains("100.00%{--bs:0.3}"));
+    assert_eq!(*encoder.0.lock().unwrap(), [60, 1]);
+    let mut mismatched = input();
+    mismatched.frames = &video;
+    assert!(css::build_dynamic(&encoder, &mut state, mismatched).is_err());
+    let mut mismatched = input();
+    mismatched.glows = &glows[..59];
+    assert!(css::build_dynamic(&encoder, &mut state, mismatched).is_err());
+}
+
+#[test]
+fn diagnostic_switches_reach_builder_and_budget() {
+    // Each child gets its own environment: the test suite never mutates global process state.
+    let Ok(case) = std::env::var("DT_RENDER_DIAGNOSTIC_TEST") else {
+        for (case, measure, loading) in [
+            ("off", None, None),
+            ("off", Some(""), Some("")),
+            ("measure", Some("1"), None),
+            ("loading", None, Some("1")),
+            ("both", Some("0"), Some("0")),
+        ] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", "diagnostic_switches_reach_builder_and_budget"])
+                .env("DT_RENDER_DIAGNOSTIC_TEST", case)
+                .env_remove("GLOWTUBE_MEASURE")
+                .env_remove("GLOWTUBE_SHOW_LOADING");
+            if let Some(value) = measure {
+                child.env("GLOWTUBE_MEASURE", value);
+            }
+            if let Some(value) = loading {
+                child.env("GLOWTUBE_SHOW_LOADING", value);
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{case}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return;
+    };
+    let expected = match case.as_str() {
+        "off" => include_str!("golden/diagnostics_off.css"),
+        "measure" => include_str!("golden/diagnostics_measure.css"),
+        "loading" => include_str!("golden/diagnostics_loading.css"),
+        "both" => include_str!("golden/diagnostics_both.css"),
+        _ => panic!("unknown diagnostic test case"),
+    };
+    assert_eq!(css::diagnostic_css_from_env(), expected);
+    let video = frames(1);
+    let values = vec![BTreeMap::from([("bs".into(), "0.3".into())])];
+    let card = Card {
+        image: "YWJj".into(),
+        height: 285,
+    };
+    let encoder = SizedEncoder {
+        bytes: 300,
+        calls: Mutex::new(vec![]),
+    };
+    let built = css::build_dynamic(
+        &encoder,
+        &mut DynamicState::default(),
+        DynamicInput {
+            frames: &video,
+            glows: &[],
+            values: &values,
+            card: &card,
+            playing: false,
+            chaos: 11.0,
+            prepared: None,
+            cheap: false,
+        },
+    )
+    .unwrap();
+    assert!(built.css.contains(expected));
+    assert_eq!(
+        built.css.contains("background:#ff00ff!important"),
+        case == "measure" || case == "both"
+    );
+    assert_eq!(
+        built.css.contains("body:has(img.hidden"),
+        case == "loading" || case == "both"
+    );
+    // The known 400-character base64 payload is the only part not reserved by video_room.
+    assert_eq!(
+        built.css.len() + built.video_room - 400,
+        dt_core::constants::CSS_LIMIT
+    );
+    assert!(!built.css.contains('\\'));
+}

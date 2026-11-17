@@ -1,5 +1,5 @@
 @property --c0{syntax:'<color>';inherits:false;initial-value:#000}@property --c1{syntax:'<color>';inherits:false;initial-value:#000}@property --c2{syntax:'<color>';inherits:false;initial-value:#000}@property --c3{syntax:'<color>';inherits:false;initial-value:#000}@property --aa{syntax:'<color>';inherits:false;initial-value:#000}@property --b0{syntax:'<number>';inherits:false;initial-value:0}@property --b1{syntax:'<number>';inherits:false;initial-value:0}@property --b2{syntax:'<number>';inherits:false;initial-value:0}@property --b3{syntax:'<number>';inherits:false;initial-value:0}@property --b4{syntax:'<number>';inherits:false;initial-value:0}@property --b5{syntax:'<number>';inherits:false;initial-value:0}@property --b6{syntax:'<number>';inherits:false;initial-value:0}@property --b7{syntax:'<number>';inherits:false;initial-value:0}@property --b8{syntax:'<number>';inherits:false;initial-value:0}@property --b9{syntax:'<number>';inherits:false;initial-value:0}@property --b10{syntax:'<number>';inherits:false;initial-value:0}@property --b11{syntax:'<number>';inherits:false;initial-value:0}@property --b12{syntax:'<number>';inherits:false;initial-value:0}@property --b13{syntax:'<number>';inherits:false;initial-value:0}@property --b14{syntax:'<number>';inherits:false;initial-value:0}@property --b15{syntax:'<number>';inherits:false;initial-value:0}@property --bs{syntax:'<number>';inherits:false;initial-value:0}@property --kk{syntax:'<number>';inherits:false;initial-value:0}@property --pr{syntax:'<number>';inherits:false;initial-value:0}
-:root{--g:1;--vw:{VIDEO_W}px;--vh:{VIDEO_H}px;--by:40%;--band:calc(var(--vh) + 56px)}
+:root{--g:1;--vw:{VIDEO_W}px;--vh:{VIDEO_H}px;--by:40%;--gm:8px;--band:calc(var(--vh) + var(--gm)*2)}
 [data-workspace-area="conversation"],[data-workspace-area="conversation"]::before{--glow:linear-gradient(#0000,#0000)}
 [data-thread-details-card]::before{--cardimg:linear-gradient(#0000,#0000)}
 [data-workspace-area="conversation"]{isolation:isolate;overflow:hidden;
@@ -23,7 +23,7 @@ img[src*="glowtube-clip-"]{position:fixed!important;position-anchor:--gtconv;lef
 translate:-50% -50%;width:var(--vw)!important;height:var(--vh)!important;max-width:none!important;max-height:none!important;
 z-index:2147483000;border-radius:12px;object-fit:cover;pointer-events:none}
 {TEXT_FLOW}[data-workspace-area="conversation"] :is(.chat-markdown,[data-user-message-bubble],[data-timeline-row-kind]),[data-workspace-area="conversation"] :is(.chat-markdown,[data-user-message-bubble],[data-timeline-row-kind]) *{
-color:#fff!important;text-shadow:0 0 3px #ffffffa0}
+color:#fff!important;text-shadow:var(--gtts,0 0 3px #ffffffa0)}
 [data-slot="composer-host"]{box-shadow:0 0 0 1px var(--c2),0 0 calc(12px + var(--bs)*60px*var(--g)) var(--c2),0 0 calc(var(--kk)*100px*var(--g)) var(--c2)!important}
 [data-chat-header]{box-shadow:0 1px calc(4px + var(--bs)*40px*var(--g)) var(--c0)}
 [data-slot="sidebar-inner"]{box-shadow:inset -1px 0 0 var(--c3),inset -14px 0 calc(var(--bs)*70px*var(--g)) -10px var(--c3)}

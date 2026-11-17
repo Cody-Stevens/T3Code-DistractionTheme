@@ -12,6 +12,14 @@ static/dynamic/idle CSS, and favicon deck stacking. There are no remaining rende
 otherwise. The original `encode_clip_svg` entry point decodes with its configured ffmpeg path
 and encodes with the native backend.
 
+CSS matches `python/theme_css.py` on the rebased main branch. The front deck uses opacity 1,
+the back deck .01, and `favicon_allow_css` hides stale clip basenames without restarting images.
+The isolated text-flow block includes the 8 px margin, crossing clips and text-shadow copies,
+and the row containment override. Dynamic writes automatically include Python's diagnostic CSS
+when `GLOWTUBE_MEASURE` or `GLOWTUBE_SHOW_LOADING` is nonempty; empty or missing variables leave
+it out. Diagnostics consume the same CSS budget as the other layers. A covered write can supply
+one still video frame while glow and values animate for their full frame count.
+
 The ffmpeg implementations remain available for experiments. A persistent worker streams IVF
 packets and Rust muxes them into a primary AVIF item plus an image-sequence track. Each clip
 starts at a keyframe. At most two processes retain video/glow configurations; shutdown closes
@@ -79,14 +87,14 @@ its build and lockfile remain in ignored `rust/target`, keeping rav1e out of pro
 
 | Applicable quality bar | Result and method |
 | --- | --- |
-| Complete theme build median <100 ms / worst <200 ms | 93.0 / 98.7 ms across 20 release builds, including eight glow renders, edge colors, both AVIF layers, CSS, and a cached four-row card with a loading status |
-| CSS <=49,500 characters, no backslashes | 45,235–46,577 characters in those builds; hard validation and overflow tests |
+| Complete theme build median <100 ms / worst <200 ms | 91.7 / 113.0 ms across 20 release builds after the CSS re-sync, including eight glow renders, edge colors, both AVIF layers, CSS, and a cached four-row card with a loading status |
+| CSS <=49,500 characters, no backslashes | 46,251–47,593 characters in those builds; hard validation and overflow tests, including diagnostic budget accounting |
 | Short clip animation | Edge 157.0.4341.60 headless screenshots show distinct frames over time; single-play native output holds its final frame |
 | Favicon exact 24 fps timing | Cumulative ties-to-even 42/41/42 ms durations; native container tests total 1,000 ms for 24 frames and 46,000 ms for 1,104 frames |
 | Padded SVG | Generated one-second fast clip has 24 frames and 4,300,007 bytes; nested AVIF animates in Edge |
 | Card <=9,000 base64 characters | Four-row Segoe card with loading status: 7,764 characters, 552x624 pixels, 16-color palette; missing-font bitmap fallback: 3,216 characters |
 | Marker RGB exact | Every original marker pixel survives palette reduction and lossless WebP decoding, checked with the independent pure-Rust decoder |
-| CSS faithful to Python | 12 generated golden fixtures cover two geometries, sparse keyframes, paused/idle values, data URLs, animation, height, and deck stacking |
+| CSS faithful to Python | 19 generated golden fixtures cover two geometries, the isolated text-flow block, sparse keyframes, paused/idle values, data URLs, animation, height, deck opacity, clip allowlists, and all diagnostic combinations |
 | Glow / edge colors | Python-generated color and glow samples; fractional three-pass Gaussian blur matches Pillow's kernel and integer rounding |
 | Overlay >=96%, A/V offset <=0.2 s, 28/28 clicks at two scales, <=1/400 false hits | Deferred to the integration owner: live helper, T3 state, and port 47873 were not changed |
 
@@ -99,8 +107,9 @@ integration should measure its six-worker scheduling margin with real content.
 One deliberate fallback change avoids repeated failed upward probes: after a synchronous clip
 fits, the state retains that level. The ahead workers perform quality exploration. Python's
 upward probe on every fallback write caused two synchronous encodes and a 166 ms median in the
-same sample. The final CSS layers and budgets remain the same. `gtjump` and its player-band
-selectors are isolated in `src/text_flow.css` and `css::text_flow_css()` for the pending re-sync.
+same sample. The final CSS layers and budgets remain the same. Text-flow properties, keyframes,
+and player-band selectors are isolated in `src/text_flow.css` and `css::text_flow_css()` for later
+re-syncs. The templates and golden fixtures are regenerated from the current Python reference.
 
 Run the mandatory checks from `rust/`, with `CARGO_BUILD_JOBS=4`:
 
@@ -112,7 +121,7 @@ cargo test --locked --workspace
 
 To repeat codec measurements, use a private Python environment with Pillow 12, NumPy, and
 websocket-client, and ffmpeg/ffprobe on PATH. `tools/probe_avif.py` generates the input and Pillow
-curves; `cargo run --release -p dt-render --example measure -- <absolute-directory> native`
+curves; `cargo run --release -p dt-render --example codec_measure -- <absolute-directory> native`
 measures native encoding. Substitute `persistent` or `oneshot` for the other backends.
 `tools/compare_ffmpeg.py`, `tools/rav1e_probe.ps1`, and `tools/matched_quality.py` compare the
 alternatives. `--example build_measure` measures complete writes and produces the padded SVG

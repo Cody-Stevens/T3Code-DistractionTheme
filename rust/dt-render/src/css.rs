@@ -23,11 +23,12 @@ pub struct DynamicState {
     pub quality: String,
 }
 
-/// Port `glowtube.build_dynamic` arguments; frames, glows and values are aligned and nonempty.
+/// Port `glowtube.build_dynamic` arguments; glow and values can animate over one still video frame.
 pub struct DynamicInput<'a> {
-    /// Usually eight 640x360 frames, one when paused, or 60 during a quiet-window write.
+    /// Usually eight 640x360 frames; one when paused or covered by a favicon clip.
+    /// Otherwise the count must match values (including long quiet-window writes).
     pub frames: &'a [Arc<Frame>],
-    /// Matching pre-rendered 128x72 glow frames (empty disables glow).
+    /// Pre-rendered 128x72 glow frames, matching values (empty disables glow).
     pub glows: &'a [Arc<Frame>],
     /// Sparse per-frame values: bass/kick each frame, bands every second, colors/progress every sixth.
     pub values: &'a [CssValues],
@@ -56,7 +57,7 @@ const CONV: &str = "[data-workspace-area=\"conversation\"]";
 const CARD: &str = "[data-thread-details-card]";
 const ANIMATED: &str = "[data-workspace-area=\"conversation\"],[data-workspace-area=\"conversation\"]::before,[data-workspace-area=\"conversation\"]::after,[data-slot=\"composer-host\"],[data-chat-header],[data-slot=\"sidebar-inner\"],[data-thread-item],[data-thread-details-card],[data-thread-details-card]::before,[data-thread-details-card]::after";
 
-/// Current Python gtjump/player-band block, isolated for the pending text-flow re-sync.
+/// Current Python text-flow block, isolated for subsequent re-syncs.
 pub fn text_flow_css() -> &'static str {
     include_str!("text_flow.css")
 }
@@ -86,14 +87,56 @@ pub fn glow_css(base64: &str) -> String {
         safe_data(base64)
     )
 }
-/// Raise the current favicon deck over the other deck.
+/// Keep the back deck playing at opacity .01 and show the front deck at opacity 1.
+/// Sidebar image stacking ignores z-index alone; both opacity rules are required.
 pub fn favicon_front_css(deck: char) -> Result<String> {
     if !matches!(deck, 'a' | 'b') {
         return Err(dt_core::Error::InvalidInput("favicon deck must be a or b"));
     }
     Ok(format!(
-        "img[src*=\"glowtube-clip-{deck}-\"]{{z-index:2147483001!important}}"
+        "img[src*=\"glowtube-clip-\"]{{opacity:.01!important}}img[src*=\"glowtube-clip-{deck}-\"]{{opacity:1!important;z-index:2147483001!important}}"
     ))
+}
+/// Hide every stale clip except the listed basenames, without replacing or restarting its image.
+/// An empty list hides all clips. Names must use ASCII letters, digits, dots, hyphens or underscores.
+pub fn favicon_allow_css(files: &[&str]) -> Result<String> {
+    let mut selector = String::from("img[src*=\"glowtube-clip-\"]");
+    for file in files {
+        if file.is_empty()
+            || !file
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+        {
+            return Err(dt_core::Error::InvalidInput("invalid favicon filename"));
+        }
+        selector.push_str(&format!(":not([src*=\"{file}\"])"));
+    }
+    Ok(selector + "{visibility:hidden!important}")
+}
+/// Optional `Player.batch` probes: loading squares first, then a magenta player for coverage charts.
+pub fn diagnostic_css(measure: bool, show_loading: bool) -> String {
+    let mut css = String::new();
+    if show_loading {
+        css.push_str(concat!(
+            "body:has(img.hidden[src*=\"glowtube-clip-a-\"])::before{content:\"\";position:fixed;left:0;top:0;",
+            "width:24px;height:24px;background:#00ff00;z-index:2147483647}",
+            "body:has(img.hidden[src*=\"glowtube-clip-b-\"])::after{content:\"\";position:fixed;left:24px;top:0;",
+            "width:24px;height:24px;background:#0000ff;z-index:2147483647}",
+        ));
+    }
+    if measure {
+        css.push_str(&format!("{CONV}::after{{background:#ff00ff!important}}"));
+    }
+    css
+}
+/// Read the Python diagnostic switches; any nonempty value (including "0") enables a switch.
+/// Dynamic writes include these snippets before computing their remaining video budget.
+pub fn diagnostic_css_from_env() -> String {
+    let enabled = |name| std::env::var_os(name).is_some_and(|value| !value.is_empty());
+    diagnostic_css(
+        enabled("GLOWTUBE_MEASURE"),
+        enabled("GLOWTUBE_SHOW_LOADING"),
+    )
 }
 fn safe_data(value: &str) -> &str {
     if valid_data(value) { value } else { "" }
@@ -204,9 +247,10 @@ pub fn build_dynamic(
 ) -> Result<BuiltTheme> {
     use crate::encode::{LADDER, avif, encode_video};
     use dt_core::{Error, constants::CSS_LIMIT};
-    let n = input.frames.len();
+    let n = input.values.len();
     if n == 0
-        || input.values.len() != n
+        || input.frames.is_empty()
+        || (input.frames.len() != 1 && input.frames.len() != n)
         || (!input.glows.is_empty() && input.glows.len() != n)
         || !input.chaos.is_finite()
         || !(0.0..=11.0).contains(&input.chaos)
@@ -226,7 +270,8 @@ pub fn build_dynamic(
     };
     let mut head = format!(":root{{--g:{:.2}}}{vars}", input.chaos / 11.0)
         + &card_height_css(input.card.height)
-        + &card_image_css(input.card);
+        + &card_image_css(input.card)
+        + &diagnostic_css_from_env();
     if !input.glows.is_empty() {
         head.push_str(&glow_css(&avif(encoder, input.glows, 30)?));
     }

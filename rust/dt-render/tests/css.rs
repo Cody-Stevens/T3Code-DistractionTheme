@@ -55,6 +55,23 @@ fn python_goldens() {
         favicon_front_css('b').unwrap(),
         include_str!("golden/front_b.css")
     );
+    assert_eq!(text_flow_css(), include_str!("golden/text_flow.css"));
+    assert_eq!(
+        favicon_allow_css(&[]).unwrap(),
+        include_str!("golden/allow_none.css")
+    );
+    assert_eq!(
+        favicon_allow_css(&["glowtube-clip-a-run-1.svg", "glowtube-clip-b-run-2.svg"]).unwrap(),
+        include_str!("golden/allow_two.css")
+    );
+    for (measure, loading, expected) in [
+        (false, false, include_str!("golden/diagnostics_off.css")),
+        (false, true, include_str!("golden/diagnostics_loading.css")),
+        (true, false, include_str!("golden/diagnostics_measure.css")),
+        (true, true, include_str!("golden/diagnostics_both.css")),
+    ] {
+        assert_eq!(diagnostic_css(measure, loading), expected);
+    }
 }
 #[test]
 fn rejects_injected_names_and_values() {
@@ -72,6 +89,9 @@ fn rejects_injected_names_and_values() {
         assert!(static_values(&BTreeMap::from([(key.into(), value.into())])).is_err());
     }
     assert!(favicon_front_css('c').is_err());
+    for file in ["", "a\\b.svg", "a\"].x{color:red}", "a/b.svg", "a\n.svg"] {
+        assert!(favicon_allow_css(&[file]).is_err());
+    }
     assert!(
         !card_image_css(&Card {
             image: "x\");color:red".into(),
