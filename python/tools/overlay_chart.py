@@ -2,7 +2,8 @@
 
 Run the helper with GLOWTUBE_MEASURE=1: the theme then paints the player magenta instead of its own
 video, so any magenta on screen means no favicon clip is covering it. Samples every ~0.3 s
-('#' covered, '.' gap, 'h' music held for the first clip, not counted) and marks each favicon change as [deck:clip number]."""
+('#' covered, '.' gap; not counted: 'h' music held for the first clip, 'p' paused, when the
+favicons are blanked on purpose) and marks each favicon change as [deck:clip number]."""
 import os
 import sys
 import time
@@ -30,10 +31,11 @@ def main(seconds: float) -> None:
         a = np.asarray(ImageGrab.grab(bbox=(l, t, r, b), all_screens=True).convert("RGB")).astype(int)
         magenta = int(((a[..., 0] > 200) & (a[..., 1] < 60) & (a[..., 2] > 200)).sum())
         try:
-            held = json.loads(urllib.request.urlopen("http://127.0.0.1:47873/status", timeout=1).read()).get("held")
+            status = json.loads(urllib.request.urlopen("http://127.0.0.1:47873/status", timeout=1).read())
         except OSError:
-            held = False
-        row.append("h" if held else "." if magenta > 3000 else "#")
+            status = {}
+        held, paused = status.get("held"), status.get("playing") is False
+        row.append("h" if held else "p" if paused else "." if magenta > 3000 else "#")
         if magenta <= 3000:
             worst = max(worst, magenta)
         if len(row) % 4 == 0:
