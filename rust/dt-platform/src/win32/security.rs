@@ -101,7 +101,7 @@ pub(crate) fn restrict_to_owner(path: &Path) -> Result<()> {
 }
 
 #[cfg(test)]
-pub(crate) fn verify_owner_acl(path: &Path, protected: bool) -> Result<bool> {
+pub(crate) fn verify_user_acl(path: &Path, explicitly_restricted: bool) -> Result<bool> {
     let file = OpenOptions::new()
         .access_mode(READ_CONTROL.0)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
@@ -127,13 +127,18 @@ pub(crate) fn verify_owner_acl(path: &Path, protected: bool) -> Result<bool> {
         .map_err(error)?;
         let _descriptor = LocalAllocation(descriptor.0);
         let sid = (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid;
-        if acl.is_null() || (*acl).AceCount != 1 || EqualSid(owner, sid).is_err() {
+        if acl.is_null() || (*acl).AceCount != 1 {
+            return Ok(false);
+        }
+        // New children inherit the DACL, not the parent's owner. An elevated creator token
+        // can default to Administrators; restrict_to_owner explicitly sets the user afterward.
+        if explicitly_restricted && EqualSid(owner, sid).is_err() {
             return Ok(false);
         }
         let mut control = 0u16;
         let mut revision = 0;
         GetSecurityDescriptorControl(descriptor, &mut control, &mut revision).map_err(error)?;
-        if protected && control & SE_DACL_PROTECTED.0 == 0 {
+        if explicitly_restricted && control & SE_DACL_PROTECTED.0 == 0 {
             return Ok(false);
         }
         let mut ace = std::ptr::null_mut();

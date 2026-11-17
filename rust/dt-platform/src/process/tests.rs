@@ -59,18 +59,19 @@ fn liveness_distinguishes_current_missing_and_zero() {
 fn owner_acl_replaces_inheritance_for_directory_file_and_new_children() {
     let temp = TempDir::new();
     restrict_to_owner(&temp.0).unwrap();
-    assert!(crate::win32::verify_owner_acl(&temp.0, true).unwrap());
+    assert!(crate::win32::verify_user_acl(&temp.0, true).unwrap());
     let file = temp.0.join("fake-token");
     fs::write(&file, b"not-a-real-token").unwrap();
-    assert!(crate::win32::verify_owner_acl(&file, false).unwrap());
+    // Only the DACL inherits. The creator token chooses the initial owner on elevated runners.
+    assert!(crate::win32::verify_user_acl(&file, false).unwrap());
     restrict_to_owner(&file).unwrap();
     restrict_to_owner(&file).unwrap();
-    assert!(crate::win32::verify_owner_acl(&file, true).unwrap());
+    assert!(crate::win32::verify_user_acl(&file, true).unwrap());
     let sub = temp.0.join("nested");
     fs::create_dir(&sub).unwrap();
     let nested = sub.join("inherited");
     fs::write(&nested, b"fake").unwrap();
-    assert!(crate::win32::verify_owner_acl(&nested, false).unwrap());
+    assert!(crate::win32::verify_user_acl(&nested, false).unwrap());
     assert!(restrict_to_owner(&temp.0.join("missing")).is_err());
 }
 
