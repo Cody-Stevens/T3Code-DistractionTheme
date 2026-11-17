@@ -122,6 +122,11 @@ background-position:{bar_pos},{ci.BAR_LEFT}px {bar_top}px}}
     return css
 
 
+def favicon_front_css(deck: str) -> str:
+    """With two favicon decks, the one showing the current clip is drawn on top."""
+    return f'img[src*="glowtube-clip-{deck}-"]{{z-index:2147483001!important}}'
+
+
 def card_height_css(height: int) -> str:
     return f"{CARD}{{--cardh:{height}px}}"
 

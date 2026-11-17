@@ -1,7 +1,8 @@
-"""Chart how often the favicon video overlay is on screen in the live T3 window.
+"""Chart how often the favicon video covers the player in the live T3 window.
 
-Samples the window every ~0.4 s for the theme's magenta outline around the clip image ('#' shown,
-'.' not shown) and marks each favicon change with the clip's number."""
+Run the helper with GLOWTUBE_MEASURE=1: the theme then paints the player magenta instead of its own
+video, so any magenta on screen means no favicon clip is covering it. Samples every ~0.3 s
+('#' covered, '.' gap) and marks each favicon change as [deck:clip number]."""
 import os
 import sys
 import time
@@ -15,25 +16,32 @@ import t3api  # noqa: E402
 from grab_t3 import find_t3  # noqa: E402
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+DECKS = {"a": ("GlowTube", ROOT), "b": ("GlowTube B", os.path.join(ROOT, "deck-b"))}
 
 
 def main(seconds: float) -> None:
     l, t, r, b = find_t3()
     api = t3api.T3Api()
-    row, t0, last = [], time.perf_counter(), None
+    row, t0, last, worst = [], time.perf_counter(), {}, 0
     while time.perf_counter() - t0 < seconds:
         a = np.asarray(ImageGrab.grab(bbox=(l, t, r, b), all_screens=True).convert("RGB")).astype(int)
-        row.append("#" if ((a[..., 0] > 220) & (a[..., 1] < 40) & (a[..., 2] > 220)).sum() > 1000 else ".")
-        if len(row) % 8 == 0:
-            fav = api.find_project("GlowTube", ROOT)["faviconPath"].rsplit("-", 1)[-1]
-            if fav != last:
-                row.append(f"[{fav}]")
-                last = fav
+        magenta = int(((a[..., 0] > 200) & (a[..., 1] < 60) & (a[..., 2] > 200)).sum())
+        row.append("." if magenta > 3000 else "#")
+        if magenta <= 3000:
+            worst = max(worst, magenta)
+        if len(row) % 4 == 0:
+            for deck, (title, root) in DECKS.items():
+                p = api.find_project(title, root)
+                fav = (p or {}).get("faviconPath") or ""
+                tag = "blank" if "blank" in fav else fav.rsplit("-", 1)[-1].removesuffix(".svg")
+                if last.get(deck) != tag:
+                    row.append(f"[{deck}:{tag}]")
+                    last[deck] = tag
         time.sleep(0.3)
     text = "".join(row)
-    shown = text.count("#")
+    shown, gaps = text.count("#"), text.count(".")
     print(text)
-    print(f"overlay visible {shown / max(1, shown + text.count('.')):.0%} of samples")
+    print(f"covered {shown / max(1, shown + gaps):.1%} of {shown + gaps} samples (largest magenta count while covered: {worst})")
 
 
 if __name__ == "__main__":

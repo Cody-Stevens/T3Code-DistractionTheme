@@ -14,6 +14,11 @@ import math
 
 from PIL import Image
 
+
+def warm_up() -> None:
+    """Load the AVIF encoder in a fresh worker process, so the first real clip doesn't pay for it."""
+    Image.new("RGB", (16, 16)).save(io.BytesIO(), format="AVIF", speed=10)
+
 WIDTHS = (640, 512, 384)
 
 

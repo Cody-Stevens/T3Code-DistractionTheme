@@ -20,3 +20,6 @@ shots/
 *token*
 !**/*token*.rs
 !**/*token*.py
+
+# Workspace folder of the second favicon project (created by setup)
+python/deck-b/

@@ -75,9 +75,23 @@ most of them are not documented by T3 Code.
   write (2.5 s of content) and holds writes for 2.2 s, publishing the clip 0.45 s into that window.
 - The server serves an external favicon only while the file exists. Clients may fetch late, so keep
   recent clips (30) and give every clip a unique name (run id + sequence).
-- Clip lengths ramp 8 s, 24 s, 45 s after a start or seek, because the next clip's encode (~0.2x its
-  length) must finish while the current one plays. Frame durations alternate 41/42 ms to average
-  exactly 24 fps. While a favicon clip covers the player, the hidden theme video is encoded cheaply.
+- **Swapping a favicon removes the old image while the new one loads (~0.3 s gap).** So there are two
+  projects ("decks"): "GlowTube" (a) and "GlowTube B" (b, rooted at `deck-b`). The next clip is
+  published to the back deck 3 s before the front clip ends; it starts playing underneath in step
+  with the audio, and 1.2 s later a theme write raises it (`favicon_front_css`: clip names carry the
+  deck letter, `glowtube-clip-<deck>-<run>-<seq>.svg`). Measured: 100% coverage in steady playback.
+- Clips are planned back to back from encode speed (speed 10 ~0.15 s and speed 8 ~0.22 s per second
+  of clip, +0.3 s start, 1.3x margin): each next clip is as long as the encoder can finish before it
+  is due, so after a start or seek they grow 6 s, ~13 s, ~33 s, 45 s. The first clip is a 6 s fast
+  encode 3 s ahead; until it shows, the theme's own video covers the player. The long quiet write
+  is built at the cheap level (~0.6 s); request it ~1.75 s before a clip starts. Frame durations
+  alternate 41/42 ms to average exactly 24 fps. While a favicon clip covers the player, the hidden
+  theme video is encoded cheaply.
+- Each favicon only renders inside a sidebar thread row, so each deck project needs one idle thread.
+  Setup does not create these yet (`t3 thread start` always sends an agent message); creating an
+  idle thread through the API is open work.
+- Measure coverage with `GLOWTUBE_MEASURE=1` (the theme paints the player magenta under the clips)
+  and `tools/overlay_chart.py`.
 - Every client signed in to the T3 server downloads the clips (the favicon is server state).
 
 ## Rules
