@@ -66,9 +66,14 @@ GLOW_W, GLOW_H = 128, 72             # glow image; the player covers the middle 
 BATCH = 0.25                         # seconds between theme writes; must stay above T3's 100 ms debounce
 STEP = math.ceil(BATCH * FPS)        # frames between write starts: writes land on a 6-frame grid
 SPAN = STEP + 2                      # video frames per write, with spares in case the next write is late
+# While a favicon clip covers the player the theme's own video is hidden, so a write only carries the
+# glow, the audio-reactive values and the card, all computed ahead from the audio. Then one write
+# covers 2 s: every write restyles the whole page, and at 4 writes a second T3's window was too busy
+# to answer its own server calls for ~2 s (tools/t3_latency.py), which delayed the favicon loads.
+COVERED_STEP = int(os.environ.get("GLOWTUBE_COVERED_STEP", "48"))
 MIN_GAP = 0.15                       # quiet time T3 needs after a write before it reloads
-QUIET_SECONDS = 2.5                  # length of the long write that covers a favicon swap
-QUIET_HOLD = 2.2                     # how long writes pause after it
+QUIET_HOLD = float(os.environ.get("GLOWTUBE_QUIET_HOLD", "2.2"))   # how long writes pause after the long write
+QUIET_SECONDS = QUIET_HOLD + 0.3      # length of the long write that covers a favicon swap
 QUIET_SETTLE = 0.45                  # wait after the long write so T3 has applied it before the swap
 CSS_LIMIT = 49_500                   # T3 allows 50,000 characters
 
@@ -215,7 +220,8 @@ class VideoReader:
         self.stop()
         with self.lock:
             self.frames.clear()
-            self.base = self.decoded = self.wanted = frame
+            self.base = self.decoded = self.wanted = self.keep = frame
+            self.started = time.monotonic()
         self.proc = subprocess.Popen(
             ["ffmpeg", "-v", "error", "-ss", f"{frame / FPS:.3f}", "-i", str(self.path), "-an",
              "-vf", f"fps={FPS},scale={FRAME_W}:{FRAME_H}:force_original_aspect_ratio=increase:flags=area,crop={FRAME_W}:{FRAME_H}", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
@@ -236,8 +242,9 @@ class VideoReader:
                     return
                 self.frames[self.decoded] = np.frombuffer(buf, np.uint8).reshape(FRAME_H, FRAME_W, 3)
                 self.decoded += 1
-                # a write asks for a whole second of frames, so keep a few seconds behind the last one
-                for old in [f for f in self.frames if f < self.wanted - FPS * 2]:
+                # keep 2 s behind the start of the latest write: a write reads up to 2.5 s ahead, and
+                # trimming from its far end discarded the next write's first frames
+                for old in [f for f in self.frames if f < min(self.keep, self.wanted) - FPS * 2]:
                     del self.frames[old]
 
     def get(self, frame: int) -> np.ndarray | None:
@@ -248,7 +255,11 @@ class VideoReader:
             if hit is not None:
                 return hit
             oldest = min(self.frames, default=self.base)
-            restart = frame < oldest or frame > self.decoded + FPS * 2
+            # Jump ahead only when the frame is out of reach. Right after a restart nothing is decoded
+            # yet, and a 2 s write asks for 60 frames at once: restarting again at its far end, then
+            # back at the next write's start, never settled (every write came back empty).
+            fresh = time.monotonic() - self.started < 1.0 and frame - self.base <= FPS * 4
+            restart = frame < oldest or (frame > self.decoded + FPS * 2 and not fresh)
         if restart:
             self.start_at(max(0, frame))
             return None
@@ -340,16 +351,22 @@ class Player:
         self.wake = threading.Event()     # set by commands so the theme is rewritten at once
         self.build_est = 0.15             # seconds a batch takes to build, measured as it runs
         self.next_k = None                # grid frame the next write should start at
+        self.step = STEP                  # frames between writes right now (COVERED_STEP under a favicon clip)
         self.hold_writes_until = 0.0      # no theme writes before this (monotonic seconds)
         self.favicon_enabled = True       # ctl "favicon off" stops favicon video (the theme video plays)
         self.favicon_live = False         # a favicon clip covers the player, so the theme video is hidden
         self.favicon_front: str | None = None   # which favicon deck is on top ("a" or "b")
+        self.favicon_allow: tuple[str, ...] | None = None   # clip files allowed to show (others are stale)
         # T3 throws away a favicon load if a theme update lands while it runs, so a swap only completes
         # when the theme is quiet for a moment. The favicon video asks for a quiet window; the write loop
         # answers with one long write (QUIET_SECONDS of content) and then holds further writes.
         self.quiet_requested = False
         self.quiet_granted = 0.0
         self.batch_quiet = False          # the batch being built is the long one for a quiet window
+        # After a start, seek or resume, the favicon video holds the music until its first clip is on
+        # screen, so the full-quality picture is there from the first beat. None: not held;
+        # math.inf: held until the clip is published; a number: released at that monotonic time.
+        self.gate_release: float | None = None
         self._card_key, self._card = None, None
         for url in urls:
             self.add(url, "end")
@@ -464,11 +481,18 @@ class Player:
             if t and t.pcm is not None:
                 self.pos = int(np.clip(self.pos + seconds * SR, 0, len(t.pcm) - 1))
 
+    @property
+    def gated(self) -> bool:
+        release = self.gate_release
+        if release is not None and time.monotonic() >= release:
+            self.gate_release = release = None
+        return release is not None
+
     # -- audio
     def _callback(self, out, frames, time_info, status):
         with self.lock:
             t = self.track
-            if not (self.playing and t is not None and t.pcm is not None):
+            if not (self.playing and t is not None and t.pcm is not None) or self.gated:
                 out.fill(0)
                 self.cb_pos, self.cb_wall = self.pos, time.perf_counter()
                 if t is not None and t.failed and len(self.queue) > 1:
@@ -486,7 +510,7 @@ class Player:
     def media_time(self) -> float:
         """Position of the sample leaving the speakers right now."""
         with self.lock:
-            if not self.playing:
+            if not self.playing or self.gated:
                 return self.pos / SR
             return max(0.0, self.cb_pos / SR + (time.perf_counter() - self.cb_wall) - self.stream.latency)
 
@@ -499,15 +523,18 @@ class Player:
             if self.reader:
                 self.reader.stop()
             self.reader = VideoReader(t.path)
-        if self.playing:
-            start, count = self.media_time() + self.build_est + self.offset, SPAN
-            self.batch_quiet = self.quiet_requested   # only this long write may open the quiet window
+        self.batch_quiet = self.quiet_requested   # only this write may open the quiet window
+        moving = self.playing and not self.gated
+        covered = moving and self.favicon_live and not self.batch_quiet
+        step = COVERED_STEP if covered else STEP
+        if moving:
+            start, count = self.media_time() + self.build_est + self.offset, step + (12 if covered else 2)
             if self.batch_quiet:
                 count = round(QUIET_SECONDS * FPS)
-        else:
+        else:                             # paused, or held for the first favicon clip: one still frame
             start, count = self.pos / SR, 1
         k0 = min(max(0, int(round(start * FPS))), t.frames - 1)
-        if self.playing and self.next_k is not None and abs(k0 - self.next_k) <= 2:
+        if moving and self.next_k is not None and abs(k0 - self.next_k) <= 2:
             k0 = self.next_k              # on schedule: stay on the grid the clips were encoded for
         # hidden under the favicon clip: spend nothing on it. The long quiet write is cheap too: 2.5 s of
         # video in one write can't be sharp anyway, and it must be built quickly for the swap.
@@ -516,6 +543,7 @@ class Player:
         if prepared:
             k0 = prepared[0]             # within a frame of the ideal start; use the clip's own start
         end = min(k0 + count, t.frames)
+        self.reader.keep = k0
         f = t.features
         frames, glows, values, last = [], [], [], None
         for k in range(k0, end):
@@ -539,19 +567,32 @@ class Player:
                 v.update({f"b{b}": f"{f['bands'][k, b]:.2f}" for b in range(theme_css.BANDS)})
             values.append(v)
         if not frames:
+            if os.environ.get("GLOWTUBE_DEBUG"):
+                print(f"[batch] no frames for {k0}-{end} (decoded {self.reader.decoded}, base {self.reader.base}, "
+                      f"covered={covered}, quiet={self.batch_quiet})", flush=True)
             return None
         elapsed, total = k0 / FPS, t.frames / FPS
         clock = f"{int(elapsed // 60)}:{int(elapsed % 60):02d} / {int(total // 60)}:{int(total % 60):02d}"
         card = self.card(f"{t.artist}  ·  {clock}" if t.artist else clock)
         if self.favicon_front:
             card += theme_css.favicon_front_css(self.favicon_front)
+        if self.favicon_allow is not None:
+            card += theme_css.favicon_allow_css(self.favicon_allow)
+        if SHOW_LOADING:                  # tools/load_watch.py: a square per deck while T3 is (re)loading its favicon
+            card += ('body:has(img.hidden[src*="glowtube-clip-a-"])::before{content:"";position:fixed;left:0;top:0;'
+                     'width:24px;height:24px;background:#00ff00;z-index:2147483647}'
+                     'body:has(img.hidden[src*="glowtube-clip-b-"])::after{content:"";position:fixed;left:24px;top:0;'
+                     'width:24px;height:24px;background:#0000ff;z-index:2147483647}')
         if MEASURE:                       # tools/overlay_chart.py: any magenta on screen is a gap in the favicon video
             card += theme_css.CONV + "::after{background:#ff00ff!important}"
+        if self.favicon_live and (covered or self.batch_quiet):
+            frames = frames[:1]           # the video is hidden under the favicon clip: one still frame is
+                                          # enough, and the write builds fast
         css = build_dynamic(frames, glows, values, card, self.playing, self.chaos, prepared, cheap)
-        if self.playing and count > SPAN:
+        if self.playing and self.batch_quiet:
             self.next_k = None            # a long write for a favicon swap; the grid picks up after it
         elif self.playing:
-            self.next_k = k0 + STEP
+            self.next_k, self.step = k0 + step, step
             for n in range(1, AHEAD_WRITES + 1):
                 if not cheap:
                     self._queue_ahead(t, k0 + n * STEP)
@@ -575,10 +616,10 @@ class Player:
 
     def until_next(self) -> float:
         """Seconds until the audio reaches the next grid frame, so the write lands on schedule."""
-        if not self.playing or self.next_k is None:
+        if not self.playing or self.gated or self.next_k is None:
             return BATCH
         ideal = (self.media_time() + self.build_est + self.offset) * FPS
-        return min(BATCH * 2, max(0.0, (self.next_k - ideal) / FPS))
+        return min(2 * self.step / FPS, max(0.0, (self.next_k - ideal) / FPS))
 
 
 SEQ = 0
@@ -611,7 +652,7 @@ def build_dynamic(frames, glows, values, card: str, playing: bool, chaos: float,
                   prepared: tuple[int, str, int, int] | None = None, cheap: bool = False) -> str:
     global SEQ, LEVEL, QUALITY
     SEQ = (SEQ + 1) % 100000
-    n = len(frames)
+    n = len(values)                   # frames may be a single still while the glow and values move
     if playing and n > 1:
         vars_css = (theme_css.keyframe_block(f"d{SEQ}", values)
                     + theme_css.animate(f"d{SEQ}", n / FPS))
@@ -718,8 +759,10 @@ AHEAD = AheadEncoder()
 
 CLIPS = HERE / "clips"
 MEASURE = bool(os.environ.get("GLOWTUBE_MEASURE"))
-CLIP_SECONDS = 45.0                  # longest favicon clip
-FIRST_CLIP_SECONDS = 6.0             # after a start or seek: short, encoded at the fast setting
+SHOW_LOADING = bool(os.environ.get("GLOWTUBE_SHOW_LOADING"))
+CLIP_SECONDS = float(os.environ.get("GLOWTUBE_CLIP_SECONDS", "22"))   # longest favicon clip (see AGENTS.md: longer ones restart)
+FIRST_CLIP_SECONDS = float(os.environ.get("GLOWTUBE_FIRST_CLIP", "10"))  # after a start or seek, encoded fast. Not shorter:
+# measured: publishing the next clip ~4 s after a 6 s first clip made the first one blink out in 2 of 4 seeks.
 FIRST_LEAD = 3.0                     # seconds from queuing that first clip to its first frame (after a start
                                      # or seek, the first long quiet write takes ~1.6 s to build while frames load)
 HANDOVER = 3.0                       # a clip on the back deck starts this long before the front one ends
@@ -731,6 +774,8 @@ PUBLISH_LEAD = SHOW_LATENCY + 0.85   # an encode must be done this long before i
 # speed 10 about 0.15 s, speed 8 about 0.22 s, plus about 0.25 s to start ffmpeg. 1.3x margin.
 ENCODE_COST = {True: 0.15 * 1.3, False: 0.22 * 1.3}
 ENCODE_START = 0.3
+GATE = os.environ.get("GLOWTUBE_GATE", "1") != "0"   # hold the music until the first clip shows
+GATE_MAX = 6.0                       # never hold it longer than this (normally ~2.5 s)
 BLANK = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"/>'
 
 
@@ -740,6 +785,7 @@ class Deck:
     name: str
     project_id: str
     clip: tuple[str, float, float] | None = None   # (track id, start, end) of the clip it shows
+    file: str = ""                                   # that clip's file name
     published_at: float = 0.0                        # monotonic time of the last publish
     blank: bool = False
 
@@ -753,6 +799,7 @@ class Planned:
     end: float
     deck: Deck
     done_by: float                   # media time its encode should be finished
+    file: str = ""                   # the clip's file name
 
 
 def encode_seconds(seconds: float, fast: bool) -> float:
@@ -780,6 +827,7 @@ class FaviconVideo:
         self.player, self.api, self.decks = player, api, decks
         self.front: Deck | None = None
         self.plan: list[Planned] = []
+        self.gate_started = 0.0
         self.seq = 0
         self.run_id = time.strftime("%H%M%S")   # clip paths stay unique across restarts
         self.pool = ProcessPoolExecutor(max_workers=1)   # never queued behind the theme's short clips
@@ -796,11 +844,45 @@ class FaviconVideo:
             print(f"favicon update failed: {exc}", file=sys.stderr, flush=True)
 
     def _drop_plan(self) -> None:
+        busy = False
         for planned in self.plan:
-            planned.fut.cancel()
+            if not planned.fut.cancel() and not planned.fut.done():
+                busy = True               # already encoding: a running future can't be cancelled
         self.plan = []
+        if busy:
+            self._new_pool()
+
+    def _new_pool(self) -> None:
+        """Replace the encoder process: after a seek the first clip must not wait behind a long
+        encode that is no longer wanted (a 45 s clip takes ~10 s)."""
+        old = self.pool
+        workers = list(getattr(old, "_processes", {}).values())
+        old.shutdown(wait=False, cancel_futures=True)
+        for worker in workers:
+            worker.terminate()           # its ffmpeg decoder exits when the pipe closes
+        self.pool = ProcessPoolExecutor(max_workers=1)
+        self.pool.submit(encoder.warm_up)
+        self._log("replaced the busy encoder")
+
+    def _allow(self) -> None:
+        """Tell the theme which clip files may show: the decks' current clips and the planned ones."""
+        self.player.favicon_allow = tuple(n for n in [d.file for d in self.decks if d.clip] +
+                                          [pl.file for pl in self.plan] if n)
+        self.player.wake.set()
+
+    def _restart(self) -> None:
+        """Start over (seek, track change, a clip ran out) without touching the favicons: T3 drops a
+        favicon load when another change or a theme write lands, so blanking both decks here made
+        the first new clip fail to show. The theme hides the old clips by name instead."""
+        self.player.gate_release = None
+        self._set_front(None)
+        self._drop_plan()
+        for deck in self.decks:
+            deck.clip = None
+        self._allow()
 
     def _blank_all(self) -> None:
+        self.player.gate_release = None
         self._set_front(None)
         self._drop_plan()
         for deck in self.decks:
@@ -808,6 +890,7 @@ class FaviconVideo:
             if not deck.blank:
                 deck.blank = True
                 self._publish(deck, CLIPS / "glowtube-blank.svg")
+        self._allow()
 
     def _set_front(self, deck: Deck | None) -> None:
         self.front = deck
@@ -849,7 +932,8 @@ class FaviconVideo:
         fut = self.pool.submit(encoder.encode_clip_svg, str(t.path), start, seconds, str(out), FPS, (FRAME_W, FRAME_H),
                                quality, speed)
         done_by = ready_at + encode_seconds(seconds, fast)
-        self.plan.append(Planned(fut, t.id, start, start + seconds, deck, done_by))
+        self.plan.append(Planned(fut, t.id, start, start + seconds, deck, done_by, out.name))
+        self._allow()
         self._log(f"queued {start:.1f}-{start + seconds:.1f}s for deck {deck.name} "
                   f"({'fast' if fast else 'good'}, due done at {done_by:.1f}s)")
 
@@ -864,6 +948,13 @@ class FaviconVideo:
             prev_deck = max((d for d in self.decks if d.clip and d.clip[0] == t.id), key=lambda d: d.clip[1])
             _, prev_start, prev_end = prev_deck.clip
             ready_at = now
+        elif GATE:                        # nothing on screen: hold the music, show the first clip, then go
+            p = self.player
+            p.gate_release, self.gate_started = math.inf, time.monotonic()
+            now = p.media_time()
+            self._log(f"holding the music at {now:.1f}s for the first clip")
+            self._queue(t, self.decks[0], now, FIRST_CLIP_SECONDS, True, now)
+            return
         else:                             # nothing playing: a short clip encoded fast, as soon as possible
             self._queue(t, self.decks[0], now + FIRST_LEAD, FIRST_CLIP_SECONDS, True, now)
             return
@@ -887,11 +978,14 @@ class FaviconVideo:
             if self.front or self.plan or not all(d.blank for d in self.decks):
                 self._blank_all()
             return
+        if p.gate_release == math.inf and time.monotonic() - self.gate_started > GATE_MAX:
+            self._log("first clip took too long; letting the music go")
+            p.gate_release = None
         now = p.media_time()
         front = self.front
         if front and not (front.clip and front.clip[0] == t.id and front.clip[1] - 0.6 <= now < front.clip[2]):
             self._log(f"front clip no longer matches (now {now:.1f}s); starting over")
-            self._blank_all()             # seek, track change, or the clip ran out
+            self._restart()               # seek, track change, or the clip ran out
             front = None
         if self.plan and (self.plan[0].track != t.id or now > self.plan[0].start + 0.6):
             first = self.plan[0]
@@ -930,7 +1024,11 @@ class FaviconVideo:
                 return
             deck = nxt.deck
             self._publish(deck, Path(path))
+            if p.gate_release == math.inf:   # the clip shows ~SHOW_LATENCY from now: start the music with it
+                p.gate_release = time.monotonic() + max(0.0, SHOW_LATENCY - p.stream.latency)
             deck.clip, deck.blank, deck.published_at = (nxt.track, nxt.start, nxt.start + frames / FPS), False, time.monotonic()
+            deck.file = nxt.file
+            self._allow()
             self._log(f"published {nxt.start:.1f}-{deck.clip[2]:.1f}s to deck {deck.name} at {now:.1f}s")
             if front is None or len(self.decks) == 1:
                 self._set_front(deck)    # nothing on screen yet, or no second deck to hide the swap
@@ -1188,7 +1286,7 @@ def serve(player: Player) -> ThreadingHTTPServer:
                     "track": t.title if t else None, "playing": player.playing, "status": player.status,
                     "time": round(player.media_time(), 1), "queue": [x.title for x in player.queue],
                     "index": player.index, "volume": player.volume, "chaos": player.chaos,
-                    "offset": round(player.offset, 3), "quality": QUALITY,
+                    "offset": round(player.offset, 3), "quality": QUALITY, "held": player.gated, "front": player.favicon_front,
                 }).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -1230,11 +1328,13 @@ def play(urls: list[str]) -> None:
             # the frames must start where the audio will be once this write is built and shown
             player.build_est = 0.7 * player.build_est + 0.3 * (time.perf_counter() - t_build)
             if css is None:
-                t = player.track
-                css = idle_theme(player)
-            if css != last_css and time.monotonic() >= player.hold_writes_until:
-                write_theme(css)
-                last_css = css
+                # no frames yet (the decoder is catching up after a jump): keep the current theme rather
+                # than flash the idle one, which has none of the favicon rules
+                css = last_css if player.playing and player.ready() and last_css else idle_theme(player)
+            if time.monotonic() >= player.hold_writes_until and (css != last_css or player.batch_quiet):
+                if css != last_css:
+                    write_theme(css)
+                    last_css = css
                 if player.quiet_requested and player.batch_quiet:
                     player.quiet_requested = player.batch_quiet = False
                     if os.environ.get("GLOWTUBE_DEBUG"):
